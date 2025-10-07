@@ -28,21 +28,20 @@
 
 #define ONBOARD_LED 2
 #define DIST_SENSORS_CNT 7
+#define USED_DIST_SENSORS_CNT 3
 
 #define LINE_RIGHT 15 //RIGHT
 #define LINE_LEFT 14 //LEFT 
-#define LINE_BACK 23 //BACK
-#define WING_MOTOR 16
 
 #define MODE_BUTTON 35
-#define START_STOP_MODULE 4
+#define START_STOP_MODULE 34
 #define BLACK_FIELD 1
 
 #define LONG_PRESS_DELAY 1000
 #define DOUBLE_PRESS_DELAY 3000
 // #define SINGLE_RANGING
 #define CONTINUOUS_RANGING
-#define MAX_RANGE 600
+#define MAX_RANGE 450
 #define MIN_RANGE 10
 #define CENTERED_TRESHOLD 20
 
@@ -72,7 +71,8 @@ typedef enum
     ATTACK,
     FOUND,
     IDLE,
-    RETREAT
+    RETREAT,
+    SPIN
 } state_t;
 
 // #define ACTIVE_ACCEL
@@ -136,6 +136,7 @@ enum AttackStates
 VL53L0X_Error status = VL53L0X_ERROR_NONE;
 uint8_t dist_sensors_xshuts[DIST_SENSORS_CNT] = {13, 12, 27, 33, 32, 25, 26};
 uint8_t dist_sensors_addrs[DIST_SENSORS_CNT] = {0x30, 0x32, 0x34, 0x36, 0x38, 0x40, 0x42};
+uint8_t sensors_to_use[USED_DIST_SENSORS_CNT] = {1, 4, 5};
 uint16_t dist_sensor_data[DIST_SENSORS_CNT];
 VL53L0X_Dev_t dist_sensors[DIST_SENSORS_CNT];
 SemaphoreHandle_t sensorsMutex;
@@ -164,19 +165,14 @@ state_t state_MOTOR_CALLBACK = PATROL;
 
 bool retreating = false;
 bool is_running = false;
-bool is_wing_running = true;
 
 
 //TODO: set lower timing budget
 static int setup()
 {
-    // esp_timer_early_init();
-    // esp_timer_init();
-
     gpio_reset_pin(ONBOARD_LED);
     gpio_set_direction(ONBOARD_LED, GPIO_MODE_OUTPUT);
     gpio_set_level(ONBOARD_LED, 1);
-    vTaskDelay(500 / portTICK_PERIOD_MS);
     gpio_set_level(ONBOARD_LED, 0);
 
     #ifdef ACTIVE_DEBUG
@@ -233,10 +229,11 @@ static int setup()
     //start-stop module
     gpio_reset_pin(START_STOP_MODULE);
     gpio_set_direction(START_STOP_MODULE, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(START_STOP_MODULE, GPIO_PULLDOWN_ENABLE);
 
-    //wing?
-    gpio_reset_pin(WING_MOTOR);
-    gpio_set_direction(WING_MOTOR, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(4);
+    gpio_set_direction(4, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(4, GPIO_PULLDOWN_ENABLE);
 
     //dist sensors
     #ifdef ACTIVE_DEBUG
@@ -260,10 +257,10 @@ static int setup()
     ESP_LOGI(MAIN_TAG, "Dist sensor initializing");
     #endif
     int return_value = 1;
-    for(int i = 0; i < 7; i++)
+    for(int i = 0; i < USED_DIST_SENSORS_CNT; i++)
     {
         // Add the sensor device to the I2C bus
-        status = init_dist_sensor(&dist_sensors[i], dist_sensors_xshuts[i], dist_sensors_addrs[i], VL53L0X_HIGH_SPEED);
+        status = init_dist_sensor(&dist_sensors[sensors_to_use[i]], dist_sensors_xshuts[sensors_to_use[i]], dist_sensors_addrs[sensors_to_use[i]], VL53L0X_HIGH_SPEED);
         vTaskDelay(100 / portTICK_PERIOD_MS);
         if(status != VL53L0X_ERROR_NONE)
         {
@@ -275,10 +272,8 @@ static int setup()
         }
 
         #ifdef CONTINUOUS_RANGING
-        status = VL53L0X_SetDeviceMode(&dist_sensors[i], VL53L0X_DEVICEMODE_CONTINUOUS_RANGING);
-        status = VL53L0X_StartMeasurement(&dist_sensors[i]);
-         
-
+        status = VL53L0X_SetDeviceMode(&dist_sensors[sensors_to_use[i]], VL53L0X_DEVICEMODE_CONTINUOUS_RANGING);
+        status = VL53L0X_StartMeasurement(&dist_sensors[sensors_to_use[i]]);
         #endif
 
         #ifdef SINGLE_RANGING
@@ -322,8 +317,6 @@ static int setup()
     gpio_set_direction(LINE_RIGHT, GPIO_MODE_INPUT);
     gpio_reset_pin(LINE_LEFT);
     gpio_set_direction(LINE_LEFT, GPIO_MODE_INPUT);
-    gpio_reset_pin(LINE_BACK);
-    gpio_set_direction(LINE_BACK, GPIO_MODE_INPUT);
     return return_value;
 
 }
@@ -398,33 +391,27 @@ int percent_to_duty_cycle(int percent)
 
 void read_sensors()
 {
-    for(int i = 0; i < 7; i++)
+    for(int i = 0; i < USED_DIST_SENSORS_CNT; i++)
     {
         // status = VL53L0X_StartMeasurement(&dist_sensors[i]);
-        status = VL53L0X_GetRangingMeasurementData(&dist_sensors[i], &measurement);
+        status = VL53L0X_GetRangingMeasurementData(&dist_sensors[sensors_to_use[i]], &measurement);
         if(status != VL53L0X_ERROR_NONE)
         {
-            dist_sensor_data[i] = MAX_RANGE;
+            dist_sensor_data[sensors_to_use[i]] = MAX_RANGE;
             continue;
         }
         // status = VL53L0X_StopMeasurement(&dist_sensors[i]);
 
         dist_sensor_data[i] = measurement.RangeMilliMeter;
-        dist_sensor_data[i] = (dist_sensor_data[i] > MAX_RANGE) ? MAX_RANGE : dist_sensor_data[i];
-        
-        // ESP_LOGI("sensor1_task", "Sensor %d: %d", i, dist_sensor_data[i]);
+        dist_sensor_data[i] = (dist_sensor_data[sensors_to_use[i]] > MAX_RANGE) ? MAX_RANGE : dist_sensor_data[i];
+        ESP_LOGI("read sensors", "sensor %d: %d", sensors_to_use[i], dist_sensor_data[sensors_to_use[i]]);
     }
 
-    ESP_LOGI("sensor1_task", "sensor %d: %d", 3, dist_sensor_data[3]);
-    // ESP_LOGI("sensor1_task", "sensor %d: %d", 4, dist_sensor_data[4]);
-    // ESP_LOGI("sensor1_task", "sensor %d: %d", 5, dist_sensor_data[5]);
-
     //read line sensors
-    #ifdef BLACK_FIELD
-    line_right = !gpio_get_level(LINE_RIGHT);
-    line_left = !gpio_get_level(LINE_LEFT);
-    line_back = !gpio_get_level(LINE_BACK);
-    #endif
+    // #ifdef BLACK_FIELD
+    // line_right = !gpio_get_level(LINE_RIGHT);
+    // line_left = !gpio_get_level(LINE_LEFT);
+    // #endif
 
     #ifndef BLACK_FIELD
     local_line_right = gpio_get_level(LINE_RIGHT);
@@ -433,36 +420,8 @@ void read_sensors()
     #endif
 }
 
-void line_sensors_state()
-{
-    //stop robot if both line sensors detect line indefinitely
-    state_PID = PATROL;
-    if(line_right && line_left)
-    {
-        state_PID = IDLE;
-        return;
-    }
-
-    if(line_right || line_left)
-    {
-        state_PID = RETREAT;
-        return;
-    }
-}
-
-void distance_sensors_state()
-{
-    if(state_PID == PATROL)
-    {
-        if(dist_sensor_data[1] < MAX_RANGE)
-            state_PID = ATTACK;
-
-        else if(error_PID > CENTERED_TRESHOLD)
-            state_PID = FOUND;
-    }
-}
-
-void sensors_to_PID_task(void *arg)
+//check for flags
+void mode_1_task(void *arg)
 {
     while(1)
     {
@@ -475,45 +434,29 @@ void sensors_to_PID_task(void *arg)
 
         read_sensors();
 
-        if(line_left && line_right)
-        {
-            state_PID = IDLE;
-            output_PID = 0;
-        }
-
-        else if(line_right || line_left)
-        {
-            state_PID = RETREAT;
-            output_PID = 85;
-        }
-
-        else if(dist_sensor_data[1] < MAX_RANGE || line_back)
+        if(dist_sensor_data[1] < MAX_RANGE)
         {
             state_PID = ATTACK;
-            #ifdef SAFE_MODE
-            output_PID = 60;
-            #else
-            output_PID = 100;
-            #endif
+            output_PID = 65;
         }
 
-        else if(dist_sensor_data[0] < dist_sensor_data[2] || dist_sensor_data[3] < MAX_RANGE || dist_sensor_data[4] < MAX_RANGE)
+        else if(dist_sensor_data[3] < MAX_RANGE)
         {
             state_PID = FOUND;
-            output_PID = -70;
+            output_PID = -65;
         }
 
-        else if(dist_sensor_data[0] > dist_sensor_data[2] || dist_sensor_data[5] < MAX_RANGE || dist_sensor_data[6] < MAX_RANGE)
+        else if(dist_sensor_data[5] < MAX_RANGE)
         
         {
             state_PID = FOUND;
-            output_PID = 70;
+            output_PID = 40;
         }
 
         else
         {
             state_PID = PATROL;
-            output_PID = 60;
+            output_PID = 65;
         }
 
         if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
@@ -525,6 +468,208 @@ void sensors_to_PID_task(void *arg)
     }
 }
 
+void mode_2_task_woodpecker(void *arg)
+{
+    while(1)
+    {
+        #ifdef USE_START_STOP_MODULE
+        if(!is_running)
+        {
+            vTaskDelete(NULL);
+        }
+        #endif
+
+        read_sensors();
+
+        if(line_right && line_left)
+        {
+            state_PID = IDLE;
+            output_PID = 0;
+        }
+
+        else if(line_right || line_left)
+        {
+            state_PID = RETREAT;
+            output_PID = 85;
+        }
+
+        else if(dist_sensor_data[1] < MAX_RANGE || dist_sensor_data[0] < MAX_RANGE || dist_sensor_data[2] < MAX_RANGE)
+        {
+            state_PID = ATTACK;
+            if(dist_sensor_data[1] < 250)
+                output_PID = 100;
+            else output_PID = 75;
+
+        }
+
+        else if(dist_sensor_data[3] < MAX_RANGE || dist_sensor_data[4] < MAX_RANGE)
+        {
+            state_PID = FOUND;
+            output_PID = -60;
+        }
+
+        else if(dist_sensor_data[5] < MAX_RANGE || dist_sensor_data[6] < MAX_RANGE)
+        
+        {
+            state_PID = FOUND;
+            output_PID = 60;
+        }
+
+        else
+        {
+            state_PID = PATROL;
+            output_PID = 75;
+            if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+            {
+                output = output_PID;
+                state = state_PID;
+                xSemaphoreGive(pidMutex);
+            }
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            state_PID = IDLE;
+            if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+            {
+                state = state_PID;
+                xSemaphoreGive(pidMutex);
+            }
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+
+        if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+        {
+            output = output_PID;
+            state = state_PID;
+            xSemaphoreGive(pidMutex);
+        }
+    }
+}
+
+void mode_3_task_wait_for_opponent()
+{
+    while(1)
+    {
+        #ifdef USE_START_STOP_MODULE
+        if(!is_running)
+        {
+            vTaskDelete(NULL);
+        }
+        #endif
+
+        read_sensors();
+
+        if(line_right && line_left)
+        {
+            state_PID = IDLE;
+            output_PID = 0;
+        }
+
+        else if(line_right || line_left)
+        {
+            state_PID = RETREAT;
+            output_PID = 85;
+        }
+
+        if(dist_sensor_data[1] < MAX_RANGE || dist_sensor_data[0] < MAX_RANGE || dist_sensor_data[2] < MAX_RANGE)
+        {
+            state_PID = ATTACK;
+            if(dist_sensor_data[1] < 300)
+                output_PID = 100;
+            else output_PID = 75;
+
+        }
+
+        else if(dist_sensor_data[3] < MAX_RANGE || dist_sensor_data[4] < MAX_RANGE)
+        {
+            state_PID = FOUND;
+            output_PID = -60;
+        }
+
+        else if(dist_sensor_data[5] < MAX_RANGE || dist_sensor_data[6] < MAX_RANGE)
+        
+        {
+            state_PID = FOUND;
+            output_PID = 60;
+        }
+
+        else
+        {
+            state_PID = IDLE;
+        }
+
+        if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+        {
+            output = output_PID;
+            state = state_PID;
+            xSemaphoreGive(pidMutex);
+        }
+    }
+}
+
+void mode_4_task_spin()
+{
+    while(1)
+    {
+        #ifdef USE_START_STOP_MODULE
+        if(!is_running)
+        {
+            vTaskDelete(NULL);
+        }
+        #endif
+
+        read_sensors();
+
+        if(dist_sensor_data[1] < MAX_RANGE || dist_sensor_data[0] < MAX_RANGE || dist_sensor_data[2] < MAX_RANGE)
+        {
+            state_PID = ATTACK;
+            if(dist_sensor_data[1] < 300)
+                output_PID = 100;
+            else output_PID = 75;
+
+        }
+
+        else if(dist_sensor_data[3] < MAX_RANGE || dist_sensor_data[4] < MAX_RANGE)
+        {
+            state_PID = FOUND;
+            output_PID = -60;
+        }
+
+        else if(dist_sensor_data[5] < MAX_RANGE || dist_sensor_data[6] < MAX_RANGE)
+        
+        {
+            state_PID = FOUND;
+            output_PID = 60;
+        }
+
+        else
+        {
+            state_PID = SPIN;
+            output_PID = 45;
+        }
+
+        if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+        {
+            output = output_PID;
+            state = state_PID;
+            xSemaphoreGive(pidMutex);
+        }
+    }
+}
+
+void mode_5_task_fullforward(void *arg)
+{
+    state_PID = ATTACK;
+    output_PID = 100;
+
+
+    if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
+    {
+        output = output_PID;
+        state = state_PID;
+        xSemaphoreGive(pidMutex);
+    }
+
+}
+
 void retreat_timer_callback(void *arg)
 {
     state_MOTOR_CALLBACK = PATROL;
@@ -532,22 +677,8 @@ void retreat_timer_callback(void *arg)
 
 }
 
-void wing_motor_callback(void *arg)
-{
-    gpio_set_level(WING_MOTOR, 0);
-    is_wing_running = false;
-}
-
 void motor_controller_callback(void *arg)
 {
-    // only run once at start of game, 
-    if(is_wing_running && wingMotorTimer == NULL)
-    {
-        esp_timer_stop(wingMotorTimer);
-        esp_timer_start_once(wingMotorTimer, WING_MOTOR_DELAY * 1000);
-
-    }
-
     #ifdef USE_START_STOP_MODULE
     if(!gpio_get_level(START_STOP_MODULE))
     {
@@ -558,6 +689,8 @@ void motor_controller_callback(void *arg)
         return;
     }
     #endif
+
+    // only run once at start of gam
 
     if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
     {
@@ -613,6 +746,11 @@ void motor_controller_callback(void *arg)
                     esp_timer_start_once(retreatTimer, RETREAT_DELAY * 1000);
                 }
                 break;
+            
+            case SPIN:
+                bdc_motor_reverse(motor1);
+                bdc_motor_forward(motor2);
+                break;
         }
 
     }
@@ -620,9 +758,9 @@ void motor_controller_callback(void *arg)
     bdc_motor_set_speed(motor1, percent_to_duty_cycle(output_MOTOR_CALLBACK));
     bdc_motor_set_speed(motor2, percent_to_duty_cycle(output_MOTOR_CALLBACK));
 
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI("motor timer", "output: %d", output_MOTOR_CALLBACK);
-    #endif
+    // #ifdef ACTIVE_DEBUG
+    ESP_LOGI("motor timer", "state: %d", state_MOTOR_CALLBACK);
+    // #endif
 }
 
 void blink_led(int cnt, int delay)
@@ -638,58 +776,66 @@ void blink_led(int cnt, int delay)
 
 void app_main(void) 
 {
-    int setup_status = setup();
+    // int setup_status = setup();
 
-    //if setup ok, blink 3 times
-    if(setup_status == 1)
-        blink_led(3, 150);
-    else
-        gpio_set_level(ONBOARD_LED, 1);
+    // //if setup ok, blink 3 times
+    // if(setup_status == 1)
+    //     blink_led(3, 150);
+    // else
+    //     gpio_set_level(ONBOARD_LED, 1);
 
-    // mode_select();
-    mode = 1;
+    // mode = 1;
 
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
-    #endif
+    // #ifdef ACTIVE_DEBUG
+    // ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
+    // #endif
 
-    #ifdef USE_START_STOP_MODULE
+    // #ifdef USE_START_STOP_MODULE
+    // while(1)
+    // {
+    //     ESP_LOGI("start stop", "%d", gpio_get_level(START_STOP_MODULE));
+    //     if(gpio_get_level(START_STOP_MODULE))
+    //     {
+    //         is_running = true;
+    //         break;
+    //     }
+        
+    // }
+    // #endif
+
+    // esp_timer_create_args_t motorControlTimerArgs = {
+    //     .callback = &motor_controller_callback,
+    //     .name = "motor_control_timer"
+    // };
+    // esp_timer_create(&motorControlTimerArgs, &motorControlTimer);
+    // esp_timer_start_periodic(motorControlTimer, MOTOR_CONTROL_TIMER_PERIOD * 1000);
+
+    // esp_timer_create_args_t retreatTimerArgs = {
+    //     .callback = &retreat_timer_callback,
+    //     .name = "retreat_timer"
+    // };
+    // esp_timer_create(&retreatTimerArgs, &retreatTimer);
+    
+    // //PATROL1 WITH PID
+    // if(mode == 1)
+    // {
+    //     xTaskCreatePinnedToCore(mode_1_task, "Mode 1 Task", 8192, NULL, 6, NULL, 1);
+    // }
+
+    // //if mode not 1, reboot esp32
+    // else if(mode != 1)
+    // {
+    //     esp_restart();
+    // }
+    gpio_reset_pin(ONBOARD_LED);
+    gpio_set_direction(ONBOARD_LED, GPIO_MODE_OUTPUT);
+
     while(1)
     {
-        if(gpio_get_level(START_STOP_MODULE))
-        {
-            is_running = true;
-            break;
-        }
-        ESP_LOGI("start stop", "%d", gpio_get_level(START_STOP_MODULE));
-    }
-    #endif
-    
-    //PATROL1 WITH PID
-    if(mode == 1)
-    {
-
-        // xTaskCreatePinnedToCore(line_sensors_task, "Line sensors", 4096, NULL, 5, NULL, 1);
-        // xTaskCreatePinnedToCore(sensors_read_task, "Group 1", 4096, NULL, 5, NULL, 0);
-        xTaskCreatePinnedToCore(sensors_to_PID_task, "PID Task", 8192, NULL, 6, NULL, 1);
-        
-        esp_timer_create_args_t motorControlTimerArgs = {
-            .callback = &motor_controller_callback,
-            .name = "motor_control_timer"
-        };
-        esp_timer_create(&motorControlTimerArgs, &motorControlTimer);
-        esp_timer_start_periodic(motorControlTimer, MOTOR_CONTROL_TIMER_PERIOD * 1000);
-
-        esp_timer_create_args_t retreatTimerArgs = {
-            .callback = &retreat_timer_callback,
-            .name = "retreat_timer"
-        };
-        esp_timer_create(&retreatTimerArgs, &retreatTimer);
-
-        esp_timer_create_args_t wingMotorTimerArgs = {
-            .callback = &wing_motor_callback,
-            .name = "wing_motor_timer"
-        };
-        esp_timer_create(&wingMotorTimerArgs, &wingMotorTimer);
+        gpio_set_level(ONBOARD_LED, 1);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        gpio_set_level(ONBOARD_LED, 0);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        ESP_LOGI("main", "loop");
     }
 }
