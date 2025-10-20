@@ -516,9 +516,9 @@ void app_main(void) {
     // mode = 1; // <--- CHANGE THIS VALUE TO TEST DIFFERENT MODES (1-4)
     blink_led(mode, 200); // Blink to confirm which mode is selected
 
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
-    #endif
+    // #ifdef ACTIVE_DEBUG
+    // ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
+    // #endif
 
     // 3. Wait for Start Signal (if enabled)
     #ifdef USE_START_STOP_MODULE
