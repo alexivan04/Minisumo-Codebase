@@ -1,188 +1,163 @@
-#include <stdio.h>
-#include <freertos/FreeRTOS.h>
-#include <stdint.h>
-#include <freertos/task.h>
-#include <esp_log.h>
-#include <driver/gpio.h>
+/*******************************************************************************
+ * @file    main.c
+ * @author  Gemini AI (Refactored from user code)
+ * @brief   Main application for an ESP32-S3 minisumo robot.
+ *
+ * @description
+ * This firmware implements a flexible, multi-mode strategy framework for a
+ * competitive minisumo robot. It uses a function pointer-based state machine
+ * to allow for easy selection of different behaviors (e.g., aggressive,
+ * defensive, calibration) before a match begins.
+ *
+ * Core Features:
+ * - Multi-Mode Strategies via Function Pointers.
+ * - Conditional, sensor-based retreat logic (no fixed timers).
+ * - Proportional control for precise aiming in calibration mode.
+ * - Clean separation of logic (strategy task) and execution (motor callback).
+ *
+ ******************************************************************************/
 
-#include "vl53l0x_esp32.h"
-#include "mma845x.h"
-#include "motor_control.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "bdc_motor.h"
 
-#include <esp_wifi.h>
-#include <nvs_flash.h>
-#include <lwip/sockets.h>
-#include <lwip/err.h>
-#include <lwip/sys.h>
-#include <esp_system.h>
-#include <esp_event.h>
-#include <esp_mac.h>
-#include <esp_timer.h>
+// --=========================== PIN DEFINITIONS ===========================--
+#define ONBOARD_LED         38
+#define MODE_BUTTON         2
+#define START_STOP_MODULE   1
 
-#include <math.h>
-#include <freertos/queue.h>
-#include <string.h>
+// Digital Distance Sensors
+#define DIST_CENTER         16
+#define DIST_R90            5
+#define DIST_R              15
+#define DIST_L90            6
+#define DIST_L              4
 
-// #include "soc/rtc_wdt.h"
+// Line Sensors (Assuming white line on black surface)
+#define LINE_RIGHT          35
+#define LINE_LEFT           13
 
-#define ONBOARD_LED 2
-#define DIST_SENSORS_CNT 7
+// --======================= CONFIGURATION & BEHAVIOR =======================--
+#define USE_START_STOP_MODULE   // Comment out to disable the start/stop pin check
+#define ACTIVE_DEBUG            // Enables verbose logging from key functions
+#define BLACK_FIELD 1           // Set to 1 for black dohyo, 0 for white dohyo
+#define DOUBLE_PRESS_TIMEOUT_MS 1000 // Time window for detecting double press
 
-#define LINE_RIGHT 15 //RIGHT
-#define LINE_LEFT 14 //LEFT 
-#define LINE_BACK 23 //BACK
-#define WING_MOTOR 16
+// --======================== TIMING & DELAY VALUES =========================--
+#define MOTOR_CONTROL_TIMER_PERIOD  15      // ms, frequency of motor updates
+#define SENSOR_READING_DELAY        10      // ms, delay in the main strategy loop
+#define LONG_PRESS_DELAY            1000    // ms, for mode selection
+#define DOUBLE_PRESS_DELAY          3000    // ms, for mode selection confirmation
 
-#define MODE_BUTTON 35
-#define START_STOP_MODULE 4
-#define BLACK_FIELD 1
+// --==================== MOTOR & PWM CONFIGURATION =====================--
+#define BDC_MCPWM_TIMER_RESOLUTION_HZ 1000000 // 1MHz, 1 tick = 1us
+#define BDC_MCPWM_FREQ_HZ             25000   // 25KHz PWM
+#define BDC_MCPWM_DUTY_TICK_MAX       (BDC_MCPWM_TIMER_RESOLUTION_HZ / BDC_MCPWM_FREQ_HZ)
+#define BDC_MCPWM_GPIO_1A             10      // Motor 1 (e.g., Left)
+#define BDC_MCPWM_GPIO_1B             9
+#define BDC_MCPWM_GPIO_2A             11      // Motor 2 (e.g., Right)
+#define BDC_MCPWM_GPIO_2B             12
 
-#define LONG_PRESS_DELAY 1000
-#define DOUBLE_PRESS_DELAY 3000
-// #define SINGLE_RANGING
-#define CONTINUOUS_RANGING
-#define MAX_RANGE 600
-#define MIN_RANGE 10
-#define CENTERED_TRESHOLD 20
+// --====================== STRATEGY TUNING CONSTANTS =======================--
+// These are used for the Proportional Control in Calibration Mode (Mode 4)
+const float Kp = 40.0;                  // Proportional Gain. Higher = faster/sharper turns.
+const int MIN_TURN_SPEED = 35;          // Minimum power to overcome motor inertia.
+const int MAX_TURN_SPEED = 80;          // Maximum power for controlled, non-overshooting turns.
 
-#define MOTOR_CONTROL_TIMER_PERIOD 15
-#define SENSOR_READING_DELAY 10
-#define RETREAT_DELAY 100
-#define WING_MOTOR_DELAY 25
-
-#define BDC_MCPWM_TIMER_RESOLUTION_HZ 1000000 // 1MHz, 1 tick = 0.1us
-#define BDC_MCPWM_FREQ_HZ             25000    // 25KHz PWM
-#define BDC_MCPWM_DUTY_TICK_MAX       (BDC_MCPWM_TIMER_RESOLUTION_HZ / BDC_MCPWM_FREQ_HZ) // maximum value we can set for the duty cycle, in ticks
-#define BDC_MCPWM_GPIO_1A              17
-#define BDC_MCPWM_GPIO_1B              5
-#define BDC_MCPWM_GPIO_2A              18
-#define BDC_MCPWM_GPIO_2B              19
+// --========================== GLOBAL VARIABLES ============================--
+// --- Hardware Handles ---
 bdc_motor_handle_t motor1 = NULL, motor2 = NULL;
-
-typedef enum
-{
-    FORWARD,
-    BACKWARD
-} direction_t;
-
-typedef enum
-{
-    PATROL,
-    ATTACK,
-    FOUND,
-    IDLE,
-    RETREAT
-} state_t;
-
-// #define ACTIVE_ACCEL
-// #define ACTIVE_DEBUG
-// #define SENSORS_DEBUG
-// #define ACTIVE_DEBUG_DISTANCE_1
-// #define ACTIVE_DEBUG_DISTANCE_2
-// #define ACTIVE_DEBUG_DISTANCE_3
-// #define ACTIVE_DEBUG_LINE
-// #define SAFE_MODE
-// #define USE_START_STOP_MODULE
-
 esp_timer_handle_t motorControlTimer = NULL;
-esp_timer_handle_t sensorReadingTimer = NULL;
-esp_timer_handle_t retreatTimer = NULL;
-esp_timer_handle_t wingMotorTimer = NULL;
-
-static mma845x_sensor_t* accel;
-int mode = 0;
-int patrol_state = 0;
-int digital_distace = 25;
-TaskHandle_t sensor_task_handles[DIST_SENSORS_CNT];
 static const char *MAIN_TAG = "main";
 
-typedef struct 
-{
-    float move_forward_duty_cycle;
-    float move_backward_duty_cycle;
-    float turn_duty_cycle;
-    int move_delay;
-    int turn_delay;
-} PatrolParams;
+// --- Robot States ---
+// This enum defines all possible actions the robot can take.
+typedef enum {
+    PATROL, // Searching for the enemy
+    ATTACK, // Charging the enemy
+    FOUND,  // Enemy is not centered, need to turn/aim
+    IDLE,   // Stopped (either aimed, or match is over)
+    RETREAT // Backing away from a line
+} state_t;
 
-typedef struct
-{
-    int sensor_id;
-} SensorTaskParams;
-
-typedef struct
-{
-    double max_integral;
-
-    double kp;
-    double ki;
-    double kd;
-} SensorRange_PID;
-
-enum PatrolSates
-{
-    PATROL1 = 1,
-    PATROL2 = 2
-};
-
-enum AttackStates
-{
-    ATTACK1 = 1,
-    ATTACK2 = 2
-};
-
-// SENSOR ORDER(ROBOT VIEW): FR F FL R90 R45 L45 L90
-VL53L0X_Error status = VL53L0X_ERROR_NONE;
-uint8_t dist_sensors_xshuts[DIST_SENSORS_CNT] = {13, 12, 27, 33, 32, 25, 26};
-uint8_t dist_sensors_addrs[DIST_SENSORS_CNT] = {0x30, 0x32, 0x34, 0x36, 0x38, 0x40, 0x42};
-uint16_t dist_sensor_data[DIST_SENSORS_CNT];
-VL53L0X_Dev_t dist_sensors[DIST_SENSORS_CNT];
-SemaphoreHandle_t sensorsMutex;
-SemaphoreHandle_t pidMutex;
-SemaphoreHandle_t stateMutex;
-int output;
-int direction = 0;
+// --- State Transfer Variables (Task -> Timer) ---
+// These variables are updated by the strategy task and read by the motor timer.
+// They are protected by the `pidMutex` for thread safety.
 state_t state = PATROL;
-
-double max_integral = 1000000;
-double kp = 0.2;
-double ki = 0;
-double kd = 0;
+int output = 0; // Represents motor speed (%) and turn direction (sign)
 state_t state_PID = PATROL;
-
 int output_PID = 0;
-double integral_PID = 0;
-double error_prev_PID = 0, error_PID;
-double derivative_PID = 0;
 
-VL53L0X_RangingMeasurementData_t measurement;
-int line_right, line_left, line_back;
+// --- Sensor Data Variables ---
+// These hold the latest sensor readings and are protected by the `sensorsMutex`.
+uint8_t dist_center, dist_r90, dist_r, dist_l90, dist_l;
+uint8_t line_right, line_left;
 
-int output_MOTOR_CALLBACK = 0;
-state_t state_MOTOR_CALLBACK = PATROL;
+// --- System & Mode Flags ---
+int mode = 0;
+bool is_running = false; // Controlled by the START_STOP_MODULE
+bool initial_move_done = false; // Flag to ensure opening move runs only once
 
-bool retreating = false;
-bool is_running = false;
-bool is_wing_running = true;
+// --- Strategy Framework Variables ---
+// A function pointer type that defines what a "strategy" function looks like.
+typedef void (*strategy_func_t)(void);
+// A global variable to hold the function pointer of the currently selected strategy.
+strategy_func_t current_strategy = NULL;
 
+// --- RTOS Synchronization ---
+SemaphoreHandle_t sensorsMutex; // Protects access to global sensor data
+SemaphoreHandle_t pidMutex;     // Protects access to `state` and `output` variables
 
-//TODO: set lower timing budget
-static int setup()
-{
-    // esp_timer_early_init();
-    // esp_timer_init();
+// --===================== FORWARD DECLARATIONS =======================--
+void strategy_bulldozer(void);
+void strategy_hunter(void);
+void strategy_matador(void);
+void strategy_calibration_turn(void);
+void run_strategy_task(void *arg);
+static void mode_select();
 
+// --==================== UTILITY & SETUP FUNCTIONS =====================--
+
+/**
+ * @brief Initializes all hardware peripherals (GPIO, Motors).
+ */
+static int setup() {
+    // Onboard LED for status indication
     gpio_reset_pin(ONBOARD_LED);
     gpio_set_direction(ONBOARD_LED, GPIO_MODE_OUTPUT);
-    gpio_set_level(ONBOARD_LED, 1);
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    gpio_set_level(ONBOARD_LED, 0);
 
-    #ifdef ACTIVE_DEBUG
+    // Input pins for sensors and buttons
+    gpio_reset_pin(MODE_BUTTON);
+    gpio_set_direction(MODE_BUTTON, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_CENTER);
+    gpio_set_direction(DIST_CENTER, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_R90);
+    gpio_set_direction(DIST_R90, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_R);
+    gpio_set_direction(DIST_R, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_L90);
+    gpio_set_direction(DIST_L90, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_L);
+    gpio_set_direction(DIST_L, GPIO_MODE_INPUT);
+    gpio_reset_pin(LINE_RIGHT);
+    gpio_set_direction(LINE_RIGHT, GPIO_MODE_INPUT);
+    gpio_reset_pin(LINE_LEFT);
+    gpio_set_direction(LINE_LEFT, GPIO_MODE_INPUT);
+
+    // --- Motor 1 (e.g., Left Motor) Initialization ---
     ESP_LOGI(MAIN_TAG, "Create DC motors");
-    #endif
-
     bdc_motor_config_t motor_config1 = {
         .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
         .pwma_gpio_num = BDC_MCPWM_GPIO_1A,
@@ -192,443 +167,39 @@ static int setup()
         .group_id = 0,
         .resolution_hz = BDC_MCPWM_TIMER_RESOLUTION_HZ,
     };
-
     ESP_ERROR_CHECK(bdc_motor_new_mcpwm_device(&motor_config1, &mcpwm_config1, &motor1));
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Enable motor 1");
-    #endif
     ESP_ERROR_CHECK(bdc_motor_enable(motor1));
-
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Forward motor 1");
-    #endif
     ESP_ERROR_CHECK(bdc_motor_forward(motor1));
 
+    // --- Motor 2 (e.g., Right Motor) Initialization ---
     bdc_motor_config_t motor_config2 = {
         .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
         .pwma_gpio_num = BDC_MCPWM_GPIO_2A,
         .pwmb_gpio_num = BDC_MCPWM_GPIO_2B,
     };
-
     bdc_motor_mcpwm_config_t mcpwm_config2 = {
         .group_id = 0,
         .resolution_hz = BDC_MCPWM_TIMER_RESOLUTION_HZ,
     };
-
     ESP_ERROR_CHECK(bdc_motor_new_mcpwm_device(&motor_config2, &mcpwm_config2, &motor2));
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Enable motor 2");
-    #endif
     ESP_ERROR_CHECK(bdc_motor_enable(motor2));
-
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Forward motor 2");
-    #endif
     ESP_ERROR_CHECK(bdc_motor_forward(motor2));
-
-    //mode button
-    gpio_reset_pin(MODE_BUTTON);
-    gpio_set_direction(MODE_BUTTON, GPIO_MODE_INPUT);
-
-    //start-stop module
-    gpio_reset_pin(START_STOP_MODULE);
-    gpio_set_direction(START_STOP_MODULE, GPIO_MODE_INPUT);
-
-    //wing?
-    gpio_reset_pin(WING_MOTOR);
-    gpio_set_direction(WING_MOTOR, GPIO_MODE_OUTPUT);
-
-    //dist sensors
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "XHSUT resetting");
-    #endif
-
-    init_xshuts(dist_sensors_xshuts, DIST_SENSORS_CNT);
-    set_all_xshut_states(dist_sensors_xshuts, true, DIST_SENSORS_CNT);
-    vTaskDelay(25 / portTICK_PERIOD_MS);
-    set_all_xshut_states(dist_sensors_xshuts, false, DIST_SENSORS_CNT);
-    vTaskDelay(25 / portTICK_PERIOD_MS);
-
-    pidMutex = xSemaphoreCreateMutex();
-
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "I2C initializing");
-    #endif
-    i2c_master_init();
-
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Dist sensor initializing");
-    #endif
-    int return_value = 1;
-    for(int i = 0; i < 7; i++)
-    {
-        // Add the sensor device to the I2C bus
-        status = init_dist_sensor(&dist_sensors[i], dist_sensors_xshuts[i], dist_sensors_addrs[i], VL53L0X_HIGH_SPEED);
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        if(status != VL53L0X_ERROR_NONE)
-        {
-            #ifdef ACTIVE_DEBUG
-            ESP_LOGE(MAIN_TAG, "Dist sensor %d initialization failed", i);
-            ESP_LOGE(MAIN_TAG, "Error: %d", status);
-            #endif
-            return_value = 0;
-        }
-
-        #ifdef CONTINUOUS_RANGING
-        status = VL53L0X_SetDeviceMode(&dist_sensors[i], VL53L0X_DEVICEMODE_CONTINUOUS_RANGING);
-        status = VL53L0X_StartMeasurement(&dist_sensors[i]);
-         
-
-        #endif
-
-        #ifdef SINGLE_RANGING
-        status = VL53L0X_SetDeviceMode(&dist_sensors[i], VL53L0X_DEVICEMODE_SINGLE_RANGING);
-        #endif
-    }
-
-    //accelerometer
-    #ifdef ACTIVE_ACCEL
-    //ACCEL
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Accel initializing");
-    #endif
-    accel = mma845x_init_sensor(I2C_MASTER_NUM, MMA845X_I2C_ADDRESS_1);
-    if (accel)
-    {   
-        // set polarity and type of INT signals if necessary
-        mma845x_config_int_signals (accel, mma845x_high_active, mma845x_push_pull);
-
-        // config HPF and enable it for accel output data
-        mma845x_config_hpf (accel, 0, true);
-        
-        // set scale and mode
-        mma845x_set_scale(accel, mma845x_scale_2_g);
-        mma845x_set_mode (accel, mma845x_normal, mma845x_odr_50, true, false);
-    }
-    else
-    {
-        #ifdef ACTIVE_DEBUG
-        ESP_LOGE(MAIN_TAG, "Could not initialize MMA845X accel. Error: %d", status);
-        #endif
-        return_value = 0;
-    }
-    #endif
-
-    //line sensors
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI(MAIN_TAG, "Line sensors initializing");
-    #endif
-    gpio_reset_pin(LINE_RIGHT);
-    gpio_set_direction(LINE_RIGHT, GPIO_MODE_INPUT);
-    gpio_reset_pin(LINE_LEFT);
-    gpio_set_direction(LINE_LEFT, GPIO_MODE_INPUT);
-    gpio_reset_pin(LINE_BACK);
-    gpio_set_direction(LINE_BACK, GPIO_MODE_INPUT);
-    return return_value;
-
-}
-  
-static void mode_select()
-{
-    int press_time = 0;
-    int double_press = 0;
-    mode = 0;
-
-    //detect long press
-    while(!double_press)
-    {
-        if(gpio_get_level(MODE_BUTTON) == 0)
-        {
-            //detect long press
-            while(gpio_get_level(MODE_BUTTON) == 0)
-            {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                press_time += 100;
-            }
-
-            if(press_time >= LONG_PRESS_DELAY)
-            {
-                mode++;
-                press_time = 0;
-                #ifdef ACTIVE_DEBUG
-                ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
-                #endif
-
-                //blink LED for mode selection
-                for(int i = 0; i < mode; i++)
-                {
-                    gpio_set_level(ONBOARD_LED, 1);
-                    vTaskDelay(250 / portTICK_PERIOD_MS);
-                    gpio_set_level(ONBOARD_LED, 0);
-                    vTaskDelay(250 / portTICK_PERIOD_MS);
-                }
-            }
-
-            else
-            {
-                //detect double press
-                while(press_time < DOUBLE_PRESS_DELAY)
-                {
-                    if(gpio_get_level(MODE_BUTTON) == 0)
-                    {
-                        while(gpio_get_level(MODE_BUTTON) == 0)
-                        {
-                            vTaskDelay(100 / portTICK_PERIOD_MS);
-                            press_time += 100;
-                        }
-                        double_press = 1;
-                        break;
-                    }
-                    vTaskDelay(100 / portTICK_PERIOD_MS);
-                    press_time += 100;
-                }
-            }
-        }
-    }
-
-    //TURN LED ON AFTER EXIT
-    gpio_set_level(ONBOARD_LED, 1);
-
+    
+    return 0;
 }
 
-int percent_to_duty_cycle(int percent)
-{
+/**
+ * @brief Converts a percentage value (0-100) to a motor duty cycle value.
+ */
+int percent_to_duty_cycle(int percent) {
     return (percent * BDC_MCPWM_DUTY_TICK_MAX) / 100;
 }
 
-void read_sensors()
-{
-    for(int i = 0; i < 7; i++)
-    {
-        // status = VL53L0X_StartMeasurement(&dist_sensors[i]);
-        status = VL53L0X_GetRangingMeasurementData(&dist_sensors[i], &measurement);
-        if(status != VL53L0X_ERROR_NONE)
-        {
-            dist_sensor_data[i] = MAX_RANGE;
-            continue;
-        }
-        // status = VL53L0X_StopMeasurement(&dist_sensors[i]);
-
-        dist_sensor_data[i] = measurement.RangeMilliMeter;
-        dist_sensor_data[i] = (dist_sensor_data[i] > MAX_RANGE) ? MAX_RANGE : dist_sensor_data[i];
-        
-        // ESP_LOGI("sensor1_task", "Sensor %d: %d", i, dist_sensor_data[i]);
-    }
-
-    ESP_LOGI("sensor1_task", "sensor %d: %d", 3, dist_sensor_data[3]);
-    // ESP_LOGI("sensor1_task", "sensor %d: %d", 4, dist_sensor_data[4]);
-    // ESP_LOGI("sensor1_task", "sensor %d: %d", 5, dist_sensor_data[5]);
-
-    //read line sensors
-    #ifdef BLACK_FIELD
-    line_right = !gpio_get_level(LINE_RIGHT);
-    line_left = !gpio_get_level(LINE_LEFT);
-    line_back = !gpio_get_level(LINE_BACK);
-    #endif
-
-    #ifndef BLACK_FIELD
-    local_line_right = gpio_get_level(LINE_RIGHT);
-    local_line_left = gpio_get_level(LINE_LEFT);
-    local_line_back = gpio_get_level(LINE_BACK);
-    #endif
-}
-
-void line_sensors_state()
-{
-    //stop robot if both line sensors detect line indefinitely
-    state_PID = PATROL;
-    if(line_right && line_left)
-    {
-        state_PID = IDLE;
-        return;
-    }
-
-    if(line_right || line_left)
-    {
-        state_PID = RETREAT;
-        return;
-    }
-}
-
-void distance_sensors_state()
-{
-    if(state_PID == PATROL)
-    {
-        if(dist_sensor_data[1] < MAX_RANGE)
-            state_PID = ATTACK;
-
-        else if(error_PID > CENTERED_TRESHOLD)
-            state_PID = FOUND;
-    }
-}
-
-void sensors_to_PID_task(void *arg)
-{
-    while(1)
-    {
-        #ifdef USE_START_STOP_MODULE
-        if(!is_running)
-        {
-            vTaskDelete(NULL);
-        }
-        #endif
-
-        read_sensors();
-
-        if(line_left && line_right)
-        {
-            state_PID = IDLE;
-            output_PID = 0;
-        }
-
-        else if(line_right || line_left)
-        {
-            state_PID = RETREAT;
-            output_PID = 85;
-        }
-
-        else if(dist_sensor_data[1] < MAX_RANGE || line_back)
-        {
-            state_PID = ATTACK;
-            #ifdef SAFE_MODE
-            output_PID = 60;
-            #else
-            output_PID = 100;
-            #endif
-        }
-
-        else if(dist_sensor_data[0] < dist_sensor_data[2] || dist_sensor_data[3] < MAX_RANGE || dist_sensor_data[4] < MAX_RANGE)
-        {
-            state_PID = FOUND;
-            output_PID = -70;
-        }
-
-        else if(dist_sensor_data[0] > dist_sensor_data[2] || dist_sensor_data[5] < MAX_RANGE || dist_sensor_data[6] < MAX_RANGE)
-        
-        {
-            state_PID = FOUND;
-            output_PID = 70;
-        }
-
-        else
-        {
-            state_PID = PATROL;
-            output_PID = 60;
-        }
-
-        if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
-        {
-            output = output_PID;
-            state = state_PID;
-            xSemaphoreGive(pidMutex);
-        }
-    }
-}
-
-void retreat_timer_callback(void *arg)
-{
-    state_MOTOR_CALLBACK = PATROL;
-    retreating = false;
-
-}
-
-void wing_motor_callback(void *arg)
-{
-    gpio_set_level(WING_MOTOR, 0);
-    is_wing_running = false;
-}
-
-void motor_controller_callback(void *arg)
-{
-    // only run once at start of game, 
-    if(is_wing_running && wingMotorTimer == NULL)
-    {
-        esp_timer_stop(wingMotorTimer);
-        esp_timer_start_once(wingMotorTimer, WING_MOTOR_DELAY * 1000);
-
-    }
-
-    #ifdef USE_START_STOP_MODULE
-    if(!gpio_get_level(START_STOP_MODULE))
-    {
-        is_running = false;
-        bdc_motor_brake(motor1);
-        bdc_motor_brake(motor2);
-        esp_timer_stop(motorControlTimer);
-        return;
-    }
-    #endif
-
-    if(xSemaphoreTake(pidMutex, pdTICKS_TO_MS(10)) == pdTRUE)
-    {
-        output_MOTOR_CALLBACK = output;
-        state_MOTOR_CALLBACK = state;
-        xSemaphoreGive(pidMutex);
-    }
-
-    if(retreating)
-    {
-        ESP_LOGI("motor timer", "retreating");
-        bdc_motor_reverse(motor1);
-        bdc_motor_reverse(motor2);
-        state_MOTOR_CALLBACK = RETREAT;
-        output_MOTOR_CALLBACK = 100;
-    }
-
-    else
-    {
-        switch(state_MOTOR_CALLBACK)
-        {
-            case PATROL:
-            case ATTACK:
-                bdc_motor_forward(motor1);
-                bdc_motor_forward(motor2);
-                break;
-
-            case FOUND:
-                if(output_MOTOR_CALLBACK < 0)
-                {
-                    bdc_motor_forward(motor1);
-                    bdc_motor_reverse(motor2);
-                    output_MOTOR_CALLBACK = -output_MOTOR_CALLBACK;
-                }
-
-                else
-                {
-                    bdc_motor_reverse(motor1);
-                    bdc_motor_forward(motor2);
-                }
-                break;
-
-            case IDLE:
-                bdc_motor_brake(motor1);
-                bdc_motor_brake(motor2);
-                break;
-
-            case RETREAT:
-                if (!retreating)
-                {
-                    retreating = true;
-                    esp_timer_stop(retreatTimer);
-                    esp_timer_start_once(retreatTimer, RETREAT_DELAY * 1000);
-                }
-                break;
-        }
-
-    }
-    
-    bdc_motor_set_speed(motor1, percent_to_duty_cycle(output_MOTOR_CALLBACK));
-    bdc_motor_set_speed(motor2, percent_to_duty_cycle(output_MOTOR_CALLBACK));
-
-    #ifdef ACTIVE_DEBUG
-    ESP_LOGI("motor timer", "output: %d", output_MOTOR_CALLBACK);
-    #endif
-}
-
-void blink_led(int cnt, int delay)
-{
-    for(int i = 0; i < cnt; i++)
-    {
+/**
+ * @brief Blinks the onboard LED a specified number of times.
+ */
+void blink_led(int cnt, int delay) {
+    for (int i = 0; i < cnt; i++) {
         gpio_set_level(ONBOARD_LED, 1);
         vTaskDelay(delay / portTICK_PERIOD_MS);
         gpio_set_level(ONBOARD_LED, 0);
@@ -636,60 +207,416 @@ void blink_led(int cnt, int delay)
     }
 }
 
-void app_main(void) 
-{
-    int setup_status = setup();
+// --==================== SENSOR & STATE LOGIC ======================--
 
-    //if setup ok, blink 3 times
-    if(setup_status == 1)
-        blink_led(3, 150);
-    else
-        gpio_set_level(ONBOARD_LED, 1);
+/**
+ * @brief Reads all digital sensors and updates global variables safely.
+ */
+void read_sensors() {
+    // Read all sensor values into local variables first
+    uint8_t dist_center_local = gpio_get_level(DIST_CENTER);
+    uint8_t dist_r90_local = gpio_get_level(DIST_R90);
+    uint8_t dist_r_local = gpio_get_level(DIST_R);
+    uint8_t dist_l90_local = gpio_get_level(DIST_L90);
+    uint8_t dist_l_local = gpio_get_level(DIST_L);
 
-    // mode_select();
-    mode = 1;
+    // IMPORTANT: This logic assumes your line sensor outputs HIGH (1) on a white line.
+    // If your sensor is inverted (outputs LOW on white), change this to !gpio_get_level().
+#ifdef BLACK_FIELD
+    uint8_t line_right_local = !gpio_get_level(LINE_RIGHT);
+    uint8_t line_left_local = !gpio_get_level(LINE_LEFT);
+#else
+    uint8_t line_right_local = gpio_get_level(LINE_RIGHT);
+    uint8_t line_left_local = gpio_get_level(LINE_LEFT);
+#endif
+
+    // Use a mutex to safely update the global variables
+    if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        dist_center = dist_center_local;
+        dist_r90 = dist_r90_local;
+        dist_r = dist_r_local;
+        dist_l90 = dist_l90_local;
+        dist_l = dist_l_local;
+        line_right = line_right_local;
+        line_left = line_left_local;
+        xSemaphoreGive(sensorsMutex);
+    }
+}
+
+// --========================= STRATEGY MODES =========================--
+
+/**
+ * @brief STRATEGY 1: Pure aggression. Charges forward at the start and attacks
+ *        any target it sees immediately with full power.
+ */
+void strategy_bulldozer(void) {
+    // --- Initial Move: A timed, full-speed blitz forward ---
+    if (!initial_move_done) {
+        ESP_LOGI("Bulldozer", "Executing initial blitz!");
+        state_PID = ATTACK;
+        output_PID = 100;
+        // This is a blocking delay, only acceptable for an initial move.
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        initial_move_done = true;
+        ESP_LOGI("Bulldozer", "Initial blitz complete.");
+        return;
+    }
+
+    // --- Main Logic ---
+    read_sensors();
+    if (line_right || line_left) {
+        state_PID = RETREAT;
+    } else if (dist_center || dist_l || dist_r || dist_l90 || dist_r90) {
+        state_PID = ATTACK;
+        output_PID = 100; // Attack with full power
+    } else {
+        state_PID = PATROL;
+        output_PID = 70; // Patrol aggressively
+    }
+}
+
+/**
+ * @brief STRATEGY 2: Search and Destroy. Actively seeks the opponent and
+ *        attempts to center on it before launching a full-power attack.
+ */
+void strategy_hunter(void) {
+    // --- Initial Move: A quick scan to find opponents not in the center ---
+    if (!initial_move_done) {
+        ESP_LOGI("Hunter", "Executing initial scan...");
+        // Turn left briefly to scan
+        state_PID = FOUND;
+        output_PID = -70; // Turn left
+        vTaskDelay(pdMS_TO_TICKS(300));
+        initial_move_done = true;
+        ESP_LOGI("Hunter", "Initial scan complete.");
+        return;
+    }
+    
+    // --- Main Logic ---
+    read_sensors();
+    if (line_right || line_left) {
+        state_PID = RETREAT;
+    } else if (dist_center) {
+        state_PID = ATTACK; // Centered: attack!
+        output_PID = 100;
+    } else if (dist_l90 || dist_l) {
+        state_PID = FOUND; // Target on left: turn left
+        output_PID = -70;
+    } else if (dist_r90 || dist_r) {
+        state_PID = FOUND; // Target on right: turn right
+        output_PID = 70;
+    } else {
+        state_PID = PATROL; // No target: search
+        output_PID = 60;
+    }
+}
+
+/**
+ * @brief STRATEGY 3: Dodge and Counter. A sample strategy that tries to
+ *        evade an initial rush and attack from the side.
+ */
+void strategy_matador(void) {
+    if (!initial_move_done) {
+        ESP_LOGI("Matador", "Executing side-step maneuver...");
+        // Sharp turn to the side
+        state_PID = FOUND;
+        output_PID = 90; // Hard right turn
+        vTaskDelay(pdMS_TO_TICKS(500));
+        initial_move_done = true;
+        ESP_LOGI("Matador", "Side-step complete.");
+        return;
+    }
+    // Main logic would be similar to Hunter, but patrol in circles.
+    strategy_hunter(); // For now, just defaults to Hunter logic after opening.
+}
+
+
+/**
+ * @brief STRATEGY 4: Calibration Mode. Rotates in place to perfectly center
+ *        on a target using proportional control, then stops.
+ */
+void strategy_calibration_turn(void) {
+    read_sensors();
+
+    if (line_right || line_left) {
+        state_PID = RETREAT;
+        return;
+    }
+
+    // Error: Negative = Left, Positive = Right, 0 = Centered or Not Seen
+    float error = 0.0;
+
+    // 1. Calculate the error based on which sensor is active
+    if (dist_center)       { error = 0.0; } // Perfect!
+    else if (dist_l90)     { error = -2.0;} // Far left
+    else if (dist_l)       { error = -1.0;} // Near left
+    else if (dist_r90)     { error = 2.0; } // Far right
+    else if (dist_r)       { error = 1.0; } // Near right
+    else { // No enemy detected
+        state_PID = IDLE;
+        output_PID = 0;
+        return;
+    }
+
+    // 2. Decide the action based on the error
+    if (error == 0.0) {
+        state_PID = IDLE; // We are aimed, so stop.
+        output_PID = 0;
+    } else {
+        state_PID = FOUND; // We need to turn.
+
+        // 3. Calculate turn speed using Proportional Control
+        int turn_speed = (int)(Kp * fabs(error));
+
+        // 4. Clamp the speed to our defined min/max values
+        if (turn_speed < MIN_TURN_SPEED) turn_speed = MIN_TURN_SPEED;
+        if (turn_speed > MAX_TURN_SPEED) turn_speed = MAX_TURN_SPEED;
+
+        // 5. Set final output, using the sign of the error for direction
+        output_PID = (error < 0) ? -turn_speed : turn_speed;
+    }
+}
+
+// --====================== CORE TASK & TIMER =======================--
+
+/**
+ * @brief The "Brain" of the robot. This task runs in a loop, executing the
+ *        currently selected strategy function and safely updating the global
+ *        state variables for the motor controller to use.
+ */
+void run_strategy_task(void *arg) {
+    while (1) {
+        if (is_running && current_strategy != NULL) {
+            // Call the function pointer, executing the active strategy's logic
+            current_strategy();
+        } else {
+            // If not running, ensure the state is idle.
+            state_PID = IDLE;
+            output_PID = 0;
+        }
+
+        // Safely transfer the calculated state/output to the global variables
+        // that the motor controller will read.
+        if (xSemaphoreTake(pidMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            state = state_PID;
+            output = output_PID;
+            xSemaphoreGive(pidMutex);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_READING_DELAY));
+    }
+}
+
+
+/**
+ * @brief The "Muscle" of the robot. This high-frequency timer callback reads
+ *        the global state and output, and translates them into physical
+ *        motor actions. It does not contain complex logic, it just executes.
+ */
+void motor_controller_callback(void *arg) {
+    #ifdef USE_START_STOP_MODULE
+    if (!gpio_get_level(START_STOP_MODULE)) {
+        is_running = false; // The main task will see this and go idle
+    }
+    #endif
+
+    // If the robot is not running, brake the motors and do nothing else.
+    if (!is_running) {
+        bdc_motor_brake(motor1);
+        bdc_motor_brake(motor2);
+        return;
+    }
+    
+    // Safely copy the global state and output into local variables
+    state_t local_state;
+    int local_output;
+    if (xSemaphoreTake(pidMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        local_state = state;
+        local_output = output;
+        xSemaphoreGive(pidMutex);
+    } else {
+        // If we fail to get the mutex, brake for safety and exit.
+        bdc_motor_brake(motor1);
+        bdc_motor_brake(motor2);
+        return;
+    }
+
+    // --- Execute Actions Based on State ---
+    switch (local_state) {
+        case PATROL:
+        case ATTACK:
+            bdc_motor_forward(motor1);
+            bdc_motor_forward(motor2);
+            bdc_motor_set_speed(motor1, percent_to_duty_cycle(local_output));
+            bdc_motor_set_speed(motor2, percent_to_duty_cycle(local_output));
+            break;
+
+        case FOUND:
+            local_output = abs(local_output); // Use absolute value for speed
+            if (output < 0) { // Negative output means turn LEFT
+                bdc_motor_reverse(motor1);
+                bdc_motor_forward(motor2);
+            } else { // Positive output means turn RIGHT
+                bdc_motor_forward(motor1);
+                bdc_motor_reverse(motor2);
+            }
+            bdc_motor_set_speed(motor1, percent_to_duty_cycle(local_output));
+            bdc_motor_set_speed(motor2, percent_to_duty_cycle(local_output));
+            break;
+
+        case RETREAT:
+            // This is our "smart retreat". It reads sensor data directly
+            // to execute the most efficient retreat maneuver.
+            uint8_t local_line_left = 0, local_line_right = 0;
+            if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                local_line_left = line_left;
+                local_line_right = line_right;
+                xSemaphoreGive(sensorsMutex);
+            }
+            
+            bdc_motor_reverse(motor1);
+            bdc_motor_reverse(motor2);
+
+            if (local_line_left && !local_line_right) { // Left sensor only: back up and turn RIGHT
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(30));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
+            } else if (local_line_right && !local_line_left) { // Right sensor only: back up and turn LEFT
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(100));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(30));
+            } else { // Both sensors or error: back up straight
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(100));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
+            }
+            break;
+
+        case IDLE:
+        default:
+            bdc_motor_brake(motor1);
+            bdc_motor_brake(motor2);
+            break;
+    }
+
+    #ifdef ACTIVE_DEBUG
+    // This log can be very spammy, use with caution.
+    // ESP_LOGI("motor_timer", "State: %d, Output: %d", local_state, local_output);
+    #endif
+}
+
+
+// --========================= MAIN APPLICATION =========================--
+
+void app_main(void) {
+    // 1. Initialize Hardware
+    setup();
+    gpio_set_level(ONBOARD_LED, 1); // Turn on LED to indicate setup is complete
+
+    // 2. Select Mode
+    // For testing, we can hardcode the mode. Uncomment mode_select() for button control.
+    mode_select();
+    // mode = 1; // <--- CHANGE THIS VALUE TO TEST DIFFERENT MODES (1-4)
+    blink_led(mode, 200); // Blink to confirm which mode is selected
 
     #ifdef ACTIVE_DEBUG
     ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
     #endif
 
+    // 3. Wait for Start Signal (if enabled)
     #ifdef USE_START_STOP_MODULE
-    while(1)
-    {
-        if(gpio_get_level(START_STOP_MODULE))
-        {
-            is_running = true;
-            break;
-        }
-        ESP_LOGI("start stop", "%d", gpio_get_level(START_STOP_MODULE));
+    ESP_LOGI(MAIN_TAG, "Waiting for start signal on GPIO %d...", START_STOP_MODULE);
+    while (!gpio_get_level(START_STOP_MODULE)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
+    is_running = true;
+    ESP_LOGI(MAIN_TAG, "Start signal received! Go!");
+    #else
+    is_running = true; // If module is disabled, start immediately
     #endif
-    
-    //PATROL1 WITH PID
-    if(mode == 1)
-    {
 
-        // xTaskCreatePinnedToCore(line_sensors_task, "Line sensors", 4096, NULL, 5, NULL, 1);
-        // xTaskCreatePinnedToCore(sensors_read_task, "Group 1", 4096, NULL, 5, NULL, 0);
-        xTaskCreatePinnedToCore(sensors_to_PID_task, "PID Task", 8192, NULL, 6, NULL, 1);
-        
-        esp_timer_create_args_t motorControlTimerArgs = {
-            .callback = &motor_controller_callback,
-            .name = "motor_control_timer"
-        };
-        esp_timer_create(&motorControlTimerArgs, &motorControlTimer);
-        esp_timer_start_periodic(motorControlTimer, MOTOR_CONTROL_TIMER_PERIOD * 1000);
-
-        esp_timer_create_args_t retreatTimerArgs = {
-            .callback = &retreat_timer_callback,
-            .name = "retreat_timer"
-        };
-        esp_timer_create(&retreatTimerArgs, &retreatTimer);
-
-        esp_timer_create_args_t wingMotorTimerArgs = {
-            .callback = &wing_motor_callback,
-            .name = "wing_motor_timer"
-        };
-        esp_timer_create(&wingMotorTimerArgs, &wingMotorTimer);
+    // 4. Assign Strategy based on Mode
+    switch (mode) {
+        case 1:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Bulldozer");
+            current_strategy = &strategy_bulldozer;
+            break;
+        case 2:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Hunter");
+            current_strategy = &strategy_hunter;
+            break;
+        case 3:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Matador");
+            current_strategy = &strategy_matador;
+            break;
+        case 4:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Calibration Aiming");
+            current_strategy = &strategy_calibration_turn;
+            break;
+        default:
+            ESP_LOGW(MAIN_TAG, "Invalid mode selected. Defaulting to Bulldozer.");
+            current_strategy = &strategy_bulldozer;
+            break;
     }
+
+    // 5. Initialize RTOS Components
+    sensorsMutex = xSemaphoreCreateMutex();
+    pidMutex = xSemaphoreCreateMutex();
+
+    // 6. Start the Brain and Muscle
+    xTaskCreate(run_strategy_task, "run_strategy_task", 4096, NULL, 5, NULL);
+
+    esp_timer_create_args_t motor_timer_args = {
+        .callback = &motor_controller_callback,
+        .name = "motor_control_timer"
+    };
+    esp_timer_create(&motor_timer_args, &motorControlTimer);
+    esp_timer_start_periodic(motorControlTimer, MOTOR_CONTROL_TIMER_PERIOD * 1000);
+
+    ESP_LOGI(MAIN_TAG, "Application startup complete.");
+}
+
+
+/**
+ * @brief Handles mode selection via button presses.
+ *
+ * A short press increments the mode number. The function exits on a double press,
+ * confirming the selection. The number of blinks indicates the current mode.
+ */
+static void mode_select() {
+    int press_time = 0;
+    int double_press = 0;
+    mode = 0;
+
+    ESP_LOGI(MAIN_TAG, "Entering mode selection. Short press to cycle, double press to confirm.");
+    gpio_set_level(ONBOARD_LED, 0);
+
+    while (!double_press) {
+        if (gpio_get_level(MODE_BUTTON) == 0) {
+            press_time = 0;
+            // Wait for button release
+            while (gpio_get_level(MODE_BUTTON) == 0) {
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                press_time += 100;
+            }
+
+            // A long press is ignored in this simplified version. A short press cycles modes.
+            mode++;
+            if (mode > 4) mode = 1; // Cycle through available modes (1-4)
+            ESP_LOGI(MAIN_TAG, "Mode set to %d", mode);
+            blink_led(mode, 150);
+
+            // Check for a double press to exit
+            int double_press_timeout = 0;
+            while(double_press_timeout < DOUBLE_PRESS_TIMEOUT_MS) {
+                if (gpio_get_level(MODE_BUTTON) == 0) {
+                    double_press = 1;
+                    break;
+                }
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                double_press_timeout += 10;
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    
+    ESP_LOGI(MAIN_TAG, "Final mode %d selected.", mode);
+    gpio_set_level(ONBOARD_LED, 1); // Turn on LED to confirm exit
 }
