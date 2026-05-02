@@ -420,9 +420,42 @@ void run_strategy_task(void *arg) {
                 if (!initial_move_timer_started) {
                     initial_move_start_time = esp_timer_get_time();
                     initial_move_timer_started = true;
+                    // Reset yaw at the start of a timed/gyro move to have a fresh reference
+                    g_imu_processed.yaw = 0.0f;
                 }
-                int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
-                if (elapsed_time_ms >= initial_move_duration_ms) {
+                
+                bool move_finished = false;
+                
+                // If it's a turn-based initial move, use Gyro
+                if (current_strategy == &strategy_hunter) {
+                    // Hunter usually does a scan turn. Let's make it scan 90 degrees.
+                    float diff = fabs(g_imu_processed.yaw);
+                    if (diff >= 90.0f) move_finished = true;
+                } 
+                else if (current_strategy == &strategy_matador_left || current_strategy == &strategy_matador_right) {
+                    // Matador does an arc. Let's say 45 degrees of arcing.
+                    float diff = fabs(g_imu_processed.yaw);
+                    if (diff >= 45.0f) move_finished = true;
+                }
+                else if (current_strategy == &strategy_viper) {
+                    // Viper initial move is a pre-turn. Let's say 30 degrees.
+                    float diff = fabs(g_imu_processed.yaw);
+                    if (diff >= 30.0f) move_finished = true;
+                }
+                else if (current_strategy == &strategy_dash_left || current_strategy == &strategy_dash_right) {
+                    // For complex multi-stage moves, we check if the strategy itself 
+                    // decided it's done (it internally calls hunter or sets initial_move_done)
+                    // But we keep the time-based safety net.
+                    int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
+                    if (elapsed_time_ms >= initial_move_duration_ms) move_finished = true;
+                }
+                else {
+                    // Default to time-based for straight moves like Bulldozer or DASH
+                    int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
+                    if (elapsed_time_ms >= initial_move_duration_ms) move_finished = true;
+                }
+
+                if (move_finished) {
                     initial_move_done = true;
                 }
             }

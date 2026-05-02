@@ -318,25 +318,35 @@ void strategy_dash_left(void) {
     static int stage = 0; 
     static int64_t stage_start = 0;
     const int pre_straight_ms = 150;
-    const int turn_ms = 300; 
+    const int turn_ms = 600; // Increased safety timeout
     const int post_straight_ms = 175;
+
     if (stage == 0) {
         stage = 1;
         stage_start = esp_timer_get_time();
         ESP_LOGI("DashL", "Starting dash-left sequence");
     }
+
     int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
+
     if (stage == 1) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= pre_straight_ms) {
             stage = 2;
             stage_start = esp_timer_get_time();
+            g_imu_processed.yaw = 0; // Reset for precise turn
         }
     } else if (stage == 2) {
         state_PID = FOUND;
-        output_PID = -100; 
-        if (elapsed >= turn_ms) {
+        output_PID = -60; // Left turn
+        float angle = g_imu_processed.yaw; // Current relative yaw
+        
+        // We want a left turn (negative yaw growth). 
+        // Check if we are between 85 and 105 degrees in the CORRECT direction.
+        // Also ensure a minimum time to avoid noise floor triggers.
+        if ((angle <= -85.0f && angle >= -105.0f && elapsed > 100) || elapsed >= turn_ms) { 
+            ESP_LOGI("DashL", "Turn complete at %.2f deg (elapsed %lld ms)", angle, elapsed);
             stage = 3;
             stage_start = esp_timer_get_time();
         }
@@ -344,7 +354,7 @@ void strategy_dash_left(void) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= post_straight_ms) {
-            stage = 4;
+            stage = 0; // Reset for next time
             ESP_LOGI("DashL", "Dash-left complete. Switching to Hunter.");
             current_strategy = &strategy_hunter;
             initial_move_done = false;
@@ -362,25 +372,34 @@ void strategy_dash_right(void) {
     static int stage = 0;
     static int64_t stage_start = 0;
     const int pre_straight_ms = 150;
-    const int turn_ms = 320; 
+    const int turn_ms = 600; // Increased safety timeout
     const int post_straight_ms = 175;
+
     if (stage == 0) {
         stage = 1;
         stage_start = esp_timer_get_time();
         ESP_LOGI("DashR", "Starting dash-right sequence");
     }
+
     int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
+
     if (stage == 1) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= pre_straight_ms) {
             stage = 2;
             stage_start = esp_timer_get_time();
+            g_imu_processed.yaw = 0; // Reset for precise turn
         }
     } else if (stage == 2) {
         state_PID = FOUND;
-        output_PID = 100; 
-        if (elapsed >= turn_ms) {
+        output_PID = 60; // Right turn
+        float angle = g_imu_processed.yaw; 
+
+        // We want a right turn (positive yaw growth).
+        // Check if we are between 85 and 105 degrees in the CORRECT direction.
+        if ((angle >= 85.0f && angle <= 105.0f && elapsed > 100) || elapsed >= turn_ms) { 
+            ESP_LOGI("DashR", "Turn complete at %.2f deg (elapsed %lld ms)", angle, elapsed);
             stage = 3;
             stage_start = esp_timer_get_time();
         }
@@ -388,7 +407,7 @@ void strategy_dash_right(void) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= post_straight_ms) {
-            stage = 4;
+            stage = 0; // Reset
             ESP_LOGI("DashR", "Dash-right complete. Switching to Hunter.");
             current_strategy = &strategy_hunter;
             initial_move_done = false;
@@ -442,10 +461,18 @@ void strategy_bounce_feint(void) {
     int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
     if (stage == 1) {
         state_PID = ATTACK; output_PID = 100; 
-        if (elapsed >= forward_ms) { stage = 2; stage_start = esp_timer_get_time(); }
+        if (elapsed >= forward_ms) { 
+            stage = 2; 
+            stage_start = esp_timer_get_time(); 
+            g_imu_processed.yaw = 0; // Reset for turn
+        }
     } else if (stage == 2) {
-    state_PID = FOUND; output_PID = (rand() & 1) ? 100 : -100; 
-        if (elapsed >= turn_ms) { stage = 3; stage_start = esp_timer_get_time(); }
+        state_PID = FOUND; output_PID = (rand() & 1) ? 60 : -60; 
+        float angle = fabs(g_imu_processed.yaw);
+        if ((angle >= 45.0f && elapsed > 50) || elapsed >= turn_ms) { // Quick 45 deg feint
+            stage = 3; 
+            stage_start = esp_timer_get_time(); 
+        }
     } else if (stage == 3) {
         state_PID = ATTACK; output_PID = 100; 
         if (elapsed >= forward2_ms) {
