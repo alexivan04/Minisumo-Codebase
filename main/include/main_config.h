@@ -6,6 +6,7 @@
 
 // #define ROBOT_VECHI
 #define LONG_PRESS_THRESHOLD_MS 1000
+#define USE_START_STOP_MODULE
 
 #ifndef ROBOT_VECHI
 // ROBOT NOU
@@ -50,6 +51,10 @@
 #define PATROL_SPEED 55
 #define ARCING_SPEED 100 
 
+// Logic Toggles
+// #define USE_LINE_SENSORS        // Comment this out to disable line sensors
+#define SENSOR_READING_DELAY 15
+
 #define SERVO_FREQ 50
 #define SERVO_TIMER LEDC_TIMER_0
 #define SERVO_MODE LEDC_LOW_SPEED_MODE
@@ -69,6 +74,12 @@
 #define MPU9250_ACCEL_XOUT_H        0x3B
 #define MPU9250_GYRO_XOUT_H         0x43
 #define MPU9250_INT_ENABLE          0x38
+
+// IMU Thresholds
+#define IMPACT_THRESHOLD            8000    // Adjust based on testing
+#define LATERAL_IMPACT_THRESHOLD    5000    // Threshold for side impacts (Acc Y)
+#define PUSHING_ACCEL_THRESHOLD     2000    // Minimum acceleration while pushing
+#define IMPACT_COOLDOWN_MS          500
 
 #else
 

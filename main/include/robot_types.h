@@ -12,7 +12,9 @@ typedef enum {
     RETREAT, 
     ARCHING,  
     ARCHING_VIPER,
-    FOLLOW_LINE 
+    FOLLOW_LINE,
+    PUSH_CONFIRM,
+    REPOSITION
 } state_t;
 
 typedef struct {
@@ -23,6 +25,10 @@ typedef struct {
     bool is_tilted;     
     float gyro_z_offset;
     float acc_z_nominal;
+    float impact_magnitude;
+    bool impact_detected;
+    bool impact_side_left;
+    bool impact_side_right;
 } imu_data_t;
 
 #endif // ROBOT_TYPES_H

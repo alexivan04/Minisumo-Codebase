@@ -40,6 +40,7 @@ extern int enemy_seen_counter;
 extern bool initial_move_done;
 extern int initial_move_duration_ms;
 extern int64_t last_enemy_seen_time;
+extern volatile imu_data_t g_imu_processed;
 
 typedef void (*strategy_func_t)(void);
 extern strategy_func_t current_strategy;
@@ -58,6 +59,12 @@ void strategy_random_micro(void);
 void strategy_prescan_aim(void);
 void strategy_staggered_burst(void);
 void strategy_viper(void);
+
+// Precision Movement
+void turn_degrees(float target_relative_degrees, int speed);
+
+// Testing Strategies
+void strategy_test_90deg_turns(void);
 
 // Utils (defined in main.c or here?)
 void read_sensors(void);

@@ -373,6 +373,7 @@ void run_strategy_task(void *arg) {
             if (!is_in_timed_retreat) {
                 read_sensors();
                 int64_t elapsed_retreat_ignore_time = (esp_timer_get_time() - retreat_ignore_time) / 1000;
+#ifdef USE_LINE_SENSORS
                 if ((line_left || line_right) && (elapsed_retreat_ignore_time > RETREAT_IGNORE_MS)) {
                     if (line_left) { is_seen_left_line = true; is_seen_right_line = false; }
                     else { is_seen_right_line = true; is_seen_left_line = false; }
@@ -383,6 +384,9 @@ void run_strategy_task(void *arg) {
                 } else {
                     current_strategy();
                 }
+#else
+                current_strategy();
+#endif
             }
             if (!initial_move_done && initial_move_duration_ms > 0) {
                 if (!initial_move_timer_started) {
@@ -411,6 +415,7 @@ void imu_task(void *arg) {
     uint32_t io_num;
     uint8_t data[14];
     int64_t last_time = esp_timer_get_time();
+    int64_t last_impact_time = 0;
     const float gyro_scale = 16.4; 
     while (1) {
         if (xQueueReceive(imu_event_queue, &io_num, portMAX_DELAY)) {
@@ -418,15 +423,48 @@ void imu_task(void *arg) {
                 int64_t now = esp_timer_get_time();
                 float dt = (now - last_time) / 1000000.0f;
                 last_time = now;
+                
+                int16_t ax = (int16_t)((data[0] << 8) | data[1]);
+                int16_t ay = (int16_t)((data[2] << 8) | data[3]);
+                int16_t az = (int16_t)((data[4] << 8) | data[5]);
+                
+                // Calculate impact magnitude (simple vector length on XY or just X if mostly forward)
+                float impact = sqrtf((float)ax*ax + (float)ay*ay);
+
                 if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    g_imu_processed.acc_x = (int16_t)((data[0] << 8) | data[1]);
-                    g_imu_processed.acc_y = (int16_t)((data[2] << 8) | data[3]);
-                    g_imu_processed.acc_z = (int16_t)((data[4] << 8) | data[5]);
+                    g_imu_processed.acc_x = ax;
+                    g_imu_processed.acc_y = ay;
+                    g_imu_processed.acc_z = az;
+                    
+                    g_imu_processed.impact_magnitude = impact;
+                    if (impact > IMPACT_THRESHOLD && (now - last_impact_time) > IMPACT_COOLDOWN_MS * 1000) {
+                        g_imu_processed.impact_detected = true;
+                        
+                        // Determine side based on Acc Y
+                        if (ay > LATERAL_IMPACT_THRESHOLD) {
+                            g_imu_processed.impact_side_left = true;
+                            g_imu_processed.impact_side_right = false;
+                        } else if (ay < -LATERAL_IMPACT_THRESHOLD) {
+                            g_imu_processed.impact_side_left = false;
+                            g_imu_processed.impact_side_right = true;
+                        } else {
+                            g_imu_processed.impact_side_left = false;
+                            g_imu_processed.impact_side_right = false;
+                        }
+
+                        last_impact_time = now;
+                    } else {
+                        g_imu_processed.impact_detected = false;
+                        g_imu_processed.impact_side_left = false;
+                        g_imu_processed.impact_side_right = false;
+                    }
+
                     float gz_raw = (int16_t)((data[12] << 8) | data[13]) - g_imu_processed.gyro_z_offset;
                     if (fabs(gz_raw) < 15.0f) gz_raw = 0;
                     g_imu_processed.yaw += (gz_raw / gyro_scale) * dt;
                     if (g_imu_processed.yaw >= 360.0f) g_imu_processed.yaw -= 360.0f;
                     if (g_imu_processed.yaw < 0.0f) g_imu_processed.yaw += 360.0f;
+                    
                     if (abs(g_imu_processed.acc_z) < (g_imu_processed.acc_z_nominal * 0.75f)) {
                         g_imu_processed.is_tilted = true;
                     } else {
@@ -434,7 +472,17 @@ void imu_task(void *arg) {
                     }
                     xSemaphoreGive(sensorsMutex);
                 }
-                printf("PY:%.1f,%d,%d,%d\n", g_imu_processed.yaw, g_imu_processed.acc_x, g_imu_processed.acc_y, g_imu_processed.acc_z);
+                
+                // // Print IMU data for testing
+                // static int print_divider = 0;
+                // if (++print_divider >= 10) { // Print every ~10 interrupts to avoid flooding
+                //     printf("IMU: YAW:%.1f ACC:%d,%d,%d IMPACT:%.1f %s\n", 
+                //         g_imu_processed.yaw, 
+                //         g_imu_processed.acc_x, g_imu_processed.acc_y, g_imu_processed.acc_z,
+                //         g_imu_processed.impact_magnitude,
+                //         g_imu_processed.impact_detected ? "!!IMPACT!!" : "");
+                //     print_divider = 0;
+                // }
             }
         }
     }
@@ -471,7 +519,7 @@ static void mode_select_count() {
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     if (press_count < 1) press_count = 1;
-    if (press_count > 14) press_count = 14;
+    if (press_count > 10) press_count = 10;
     mode = press_count;
     blink_led(mode, 150);
     gpio_set_level(ONBOARD_LED, 1);
@@ -547,6 +595,7 @@ void app_main(void) {
         case 7: current_strategy = &strategy_dash_left; initial_move_duration_ms = 0; break;
         case 8: current_strategy = &strategy_dash_right; initial_move_duration_ms = 0; break;
         case 9: current_strategy = &strategy_viper; initial_move_duration_ms = 0; break;
+        case 10: current_strategy = &strategy_test_90deg_turns; initial_move_duration_ms = 0; break;
         default: current_strategy = &strategy_bulldozer; initial_move_duration_ms = BULLDOZER_INITIAL_MOVE_DURATION_MS; break;
     }
 

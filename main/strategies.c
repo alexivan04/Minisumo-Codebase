@@ -1,12 +1,35 @@
 #include "strategies.h"
 
 void strategy_bulldozer(void) {
+    static bool impact_confirmed = false;
+
     if (!initial_move_done) {
         ESP_LOGI("Bulldozer", "Executing initial blitz!");
         state_PID = ATTACK;
         output_PID = 100;
+
+        // Use IMU to check if we hit something during the blitz
+        if (g_imu_processed.impact_detected) {
+            ESP_LOGI("Bulldozer", "Impact detected during initial move!");
+            impact_confirmed = true;
+        }
+
+        if (impact_confirmed) {
+            // If we hit something, check if we're still meeting resistance (pushing)
+            // If acceleration is low but we are at full power, we are likely pushing or stalled
+            if (abs(g_imu_processed.acc_x) < PUSHING_ACCEL_THRESHOLD) {
+                ESP_LOGI("Bulldozer", "Pushing verified.");
+                // Keep pushing - do nothing, let state_PID = ATTACK continue
+            } else {
+                ESP_LOGW("Bulldozer", "Impact but no resistance. Target might have slipped.");
+                impact_confirmed = false;
+                initial_move_done = true; // Switch to hunter to re-locate
+            }
+        }
     }
-    else strategy_hunter();
+    else {
+        strategy_hunter();
+    }
 }
 
 void strategy_hunter(void) {
@@ -34,6 +57,21 @@ void strategy_hunter(void) {
         }
 
         if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) {
+            // Check for side-swipes during attack
+            if (g_imu_processed.impact_detected) {
+                if (g_imu_processed.impact_side_left) {
+                    ESP_LOGW("Hunter", "Side impact LEFT! Adjusting...");
+                    state_PID = FOUND;
+                    output_PID = -90; // Hard turn left to face opponent
+                    return;
+                } else if (g_imu_processed.impact_side_right) {
+                    ESP_LOGW("Hunter", "Side impact RIGHT! Adjusting...");
+                    state_PID = FOUND;
+                    output_PID = 90; // Hard turn right to face opponent
+                    return;
+                }
+            }
+
             if (dist_center && dist_l && dist_r) {
                 state_PID = ATTACK;
                 output_PID = 100;
@@ -503,5 +541,71 @@ void strategy_staggered_burst(void) {
         current_strategy = &strategy_hunter;
         initial_move_done = false;
         initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+    }
+}
+
+void turn_degrees(float target_relative_degrees, int speed) {
+    static float start_yaw = -1;
+    static float target_yaw = -1;
+    static bool is_turning = false;
+
+    if (!is_turning) {
+        start_yaw = g_imu_processed.yaw;
+        target_yaw = start_yaw + target_relative_degrees;
+        while (target_yaw >= 360.0f) target_yaw -= 360.0f;
+        while (target_yaw < 0.0f) target_yaw += 360.0f;
+        is_turning = true;
+    }
+
+    float diff = fabs(g_imu_processed.yaw - target_yaw);
+    if (diff > 180.0f) diff = 360.0f - diff;
+
+    if (diff > 5.0f) {
+        state_PID = FOUND;
+        output_PID = (target_relative_degrees > 0) ? -speed : speed;
+    } else {
+        state_PID = IDLE;
+        output_PID = 0;
+        is_turning = false;
+        // This would usually transition to a next state
+    }
+}
+
+void strategy_test_90deg_turns(void) {
+    static int phase = 0;
+    static int64_t phase_start = 0;
+    int64_t now = esp_timer_get_time();
+
+    if (phase == 0) {
+        // Wait 2 seconds before starting
+        if (phase_start == 0) phase_start = now;
+        if ((now - phase_start) / 1000 > 2000) {
+            phase = 1;
+            phase_start = 0;
+            ESP_LOGI("Test", "Phase 1: Turning +90 degrees");
+        }
+    } else if (phase == 1) {
+        // Turn +90
+        turn_degrees(90, 40);
+        if (state_PID == IDLE) { // turn_degrees sets IDLE when done
+            phase = 2;
+            phase_start = now;
+            ESP_LOGI("Test", "Phase 1 complete. Pausing.");
+        }
+    } else if (phase == 2) {
+        // Wait 2 seconds
+        if ((now - phase_start) / 1000 > 2000) {
+            phase = 3;
+            phase_start = 0;
+            ESP_LOGI("Test", "Phase 3: Turning -90 degrees");
+        }
+    } else if (phase == 3) {
+        // Turn -90
+        turn_degrees(-90, 40);
+        if (state_PID == IDLE) {
+            phase = 0; // Loop back
+            phase_start = now;
+            ESP_LOGI("Test", "Phase 3 complete. Looping back to Phase 0.");
+        }
     }
 }
