@@ -1,0 +1,1893 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include <stdlib.h>
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "bdc_motor.h"
+#include "driver/ledc.h"
+
+#include "driver/i2c.h"
+
+// #define ROBOT_VECHI
+#define LONG_PRESS_THRESHOLD_MS 1000
+
+#ifndef ROBOT_VECHI
+// ROBOT NOU
+// --=========================== PIN DEFINITIONS ===========================--
+#define ONBOARD_LED         38
+#define MODE_BUTTON         2
+#define START_STOP_MODULE   1
+#define SERVO_GPIO             21
+
+// Digital Distance Sensors
+#define DIST_CENTER         16
+#define DIST_R90            5
+#define DIST_R              15
+#define DIST_L90            6
+#define DIST_L              4
+
+// Line Sensors (Assuming white line on black surface)
+#define LINE_RIGHT          35
+#define LINE_LEFT           13
+
+#define BDC_MCPWM_GPIO_1A             9      // Motor 1 (e.g., Left)
+#define BDC_MCPWM_GPIO_1B             10
+#define BDC_MCPWM_GPIO_2A             11      // Motor 2 (e.g., Right)
+#define BDC_MCPWM_GPIO_2B             12
+
+#define BULLDOZER_INITIAL_MOVE_DURATION_MS      400
+#define HUNTER_INITIAL_MOVE_DURATION_MS          25
+#define MATADOR_INITIAL_MOVE_DURATION_MS         250
+#define RETREAT_DURATION_MS                      25
+#define EDGE_WALKER_INITIAL_TURN_DURATION_MS     2000 // Time to turn to find the line
+#define VIPER_INITIAL_MOVE_DURATION_MS           300
+#define ADAPTIVE_HUNTER_INITIAL_MOVE_DURATION_MS 25
+#define ADAPTIVE_TIMEOUT_MS                      4000 // Time in ms before switching to aggressive patrol
+#define LEFT_MOTOR_MULTIPLIER 1
+#define RIGHT_MOTOR_MULTIPLIER 1
+#define VIPER_PRETURN_MS 750 // duration for the small in-place turn
+#define VIPER_RETURN_SPEED 100
+#define VIPER_ARCH_MS 1000
+#define VIPER_ARCING_SPEED 100
+
+#define RETREAT_IGNORE_MS 125
+#define PATROL_SPEED 55
+#define ARCING_SPEED 100 
+
+#define SERVO_FREQ 50
+#define SERVO_TIMER LEDC_TIMER_0
+#define SERVO_MODE LEDC_LOW_SPEED_MODE
+#define SERVO_CHANNEL LEDC_CHANNEL_0
+#define SERVO_RESOLUTION LEDC_TIMER_14_BIT
+
+// I2C Definitions
+#define I2C_MASTER_SCL_IO           37      
+#define I2C_MASTER_SDA_IO           36      
+#define I2C_MASTER_NUM              I2C_NUM_0 
+#define I2C_MASTER_FREQ_HZ          400000  
+#define MPU9250_ADDR                0x68    // Default I2C address
+#define MPU9250_INT_GPIO            7
+
+// MPU9250 Registers
+#define MPU9250_PWR_MGMT_1          0x6B
+#define MPU9250_ACCEL_XOUT_H        0x3B
+#define MPU9250_GYRO_XOUT_H         0x43
+#define MPU9250_INT_ENABLE          0x38
+
+// Data Structure
+typedef struct {
+    int16_t acc_x, acc_y, acc_z;
+    int16_t gyro_x, gyro_y, gyro_z;
+    
+    // Calculated Orientation
+    float yaw;          // Relative heading in degrees (0-360)
+    float pitch;        // Forward/backward tilt
+    bool is_tilted;     // Lifted detection
+    
+    // Calibration Offsets
+    float gyro_z_offset;
+    float acc_z_nominal;
+} imu_data_t;
+
+volatile imu_data_t g_imu_processed; // Processed values for strategy
+QueueHandle_t imu_event_queue;
+
+static esp_err_t mpu9250_register_write(uint8_t reg_addr, uint8_t data) {
+    uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_write_to_device(I2C_MASTER_NUM, MPU9250_ADDR, write_buf, sizeof(write_buf), pdMS_TO_TICKS(100));
+}
+
+static esp_err_t mpu9250_register_read(uint8_t reg_addr, uint8_t *data, size_t len) {
+    return i2c_master_write_read_device(I2C_MASTER_NUM, MPU9250_ADDR, &reg_addr, 1, data, len, pdMS_TO_TICKS(100));
+}
+
+void mpu9250_init() {
+    // 1. Initialize I2C
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+
+    // 2. Wake up MPU9250 (Clear sleep bit)
+    mpu9250_register_write(MPU9250_PWR_MGMT_1, 0x01); 
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Set Gyro to ±2000 deg/s (the maximum)
+    // Register 0x1B (GYRO_CONFIG), Bits [4:3] = 11 (0x18)
+    mpu9250_register_write(0x1B, 0x18); 
+
+    // Set Accelerometer to ±16g (the maximum)
+    // Register 0x1C (ACCEL_CONFIG), Bits [4:3] = 11 (0x18)
+    mpu9250_register_write(0x1C, 0x18);
+
+    // 3. Enable Data Ready Interrupt
+    mpu9250_register_write(MPU9250_INT_ENABLE, 0x01);
+}
+
+static void IRAM_ATTR imu_gpio_isr_handler(void* arg) {
+    uint32_t gpio_num = (uint32_t) arg;
+    xQueueSendFromISR(imu_event_queue, &gpio_num, NULL);
+}
+
+void imu_interrupt_setup() {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_POSEDGE, // MPU9250 INT is active high by default
+        .pin_bit_mask = (1ULL << MPU9250_INT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_down_en = 1, // Ensure it stays low when not driven
+    };
+    gpio_config(&io_conf);
+    
+    imu_event_queue = xQueueCreate(10, sizeof(uint32_t));
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(MPU9250_INT_GPIO, imu_gpio_isr_handler, (void*) MPU9250_INT_GPIO);
+}
+
+void calibrate_imu() {
+    float z_sum = 0;
+    float acc_z_sum = 0;
+    int samples = 200;
+    uint8_t data[14];
+
+    ESP_LOGI("IMU", "CALIBRATING... DO NOT MOVE");
+    for (int i = 0; i < samples; i++) {
+        if (mpu9250_register_read(MPU9250_ACCEL_XOUT_H, data, 14) == ESP_OK) {
+            z_sum += (int16_t)((data[12] << 8) | data[13]);
+            acc_z_sum += (int16_t)((data[4] << 8) | data[5]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    g_imu_processed.gyro_z_offset = z_sum / samples;
+    g_imu_processed.acc_z_nominal = acc_z_sum / samples;
+    ESP_LOGI("IMU", "Done. Offset Z: %.2f", g_imu_processed.gyro_z_offset);
+}
+
+
+void servo_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode       = SERVO_MODE,
+        .timer_num        = SERVO_TIMER,
+        .duty_resolution  = SERVO_RESOLUTION,
+        .freq_hz          = SERVO_FREQ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer);
+
+    ledc_channel_config_t channel = {
+        .gpio_num       = SERVO_GPIO,
+        .speed_mode     = SERVO_MODE,
+        .channel        = SERVO_CHANNEL,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .timer_sel      = SERVO_TIMER,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ledc_channel_config(&channel);
+}
+
+void servo_set_angle(float angle)
+{
+    if(angle < 0) angle = 0;
+    if(angle > 180) angle = 180;
+
+    uint32_t max_duty = (1 << SERVO_RESOLUTION) - 1;
+
+    float period_ms = 20.0;      // 50 Hz
+    float min_pulse = 0.5;
+    float max_pulse = 2.5;
+
+    float pulse = min_pulse + (angle / 180.0) * (max_pulse - min_pulse);
+
+    uint32_t duty = (pulse / period_ms) * max_duty;
+
+    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
+    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+}
+#else
+
+#define ONBOARD_LED         38
+#define MODE_BUTTON         2
+#define START_STOP_MODULE   1
+// #define USE_LATERAL_SENSORS   // Enable use of front lateral distance sensors
+
+
+// Robot vechi ===========================================================
+
+// Digital Distance Sensors
+#define DIST_CENTER         17
+#define DIST_R90            16
+#define DIST_RF             15
+#define DIST_R              7
+#define DIST_LF             5
+#define DIST_L90            4
+#define DIST_L              6
+
+// Line Sensors (Assuming white line on black surface)
+#define LINE_RIGHT          36
+#define LINE_LEFT           35
+
+#define BDC_MCPWM_GPIO_1A             10      // Motor 1 (e.g., Left)
+#define BDC_MCPWM_GPIO_1B             9
+#define BDC_MCPWM_GPIO_2A             11      // Motor 2 (e.g., Right)
+#define BDC_MCPWM_GPIO_2B             12
+
+#define BULLDOZER_INITIAL_MOVE_DURATION_MS       365
+#define HUNTER_INITIAL_MOVE_DURATION_MS          25
+#define MATADOR_INITIAL_MOVE_DURATION_MS         450
+#define RETREAT_DURATION_MS                      175
+#define EDGE_WALKER_INITIAL_TURN_DURATION_MS     2000 // Time to turn to find the line
+#define VIPER_INITIAL_MOVE_DURATION_MS           500
+#define ADAPTIVE_HUNTER_INITIAL_MOVE_DURATION_MS 25
+#define ADAPTIVE_TIMEOUT_MS                      4000 // Time in ms before switching to aggressive patrol
+#define PATROL_SPEED 50
+#define ARCING_SPEED 90
+#define VIPER_PRETURN_MS 200 // duration for the small in-place turn
+#define VIPER_RETURN_SPEED 100
+#define VIPER_ARCH_MS 250
+#define VIPER_ARCING_SPEED 100
+    
+#define LEFT_MOTOR_MULTIPLIER 1.15
+#define RIGHT_MOTOR_MULTIPLIER 1.0
+#define RETREAT_IGNORE_MS 50                    
+#endif
+// ===========================================================================
+
+// --======================= CONFIGURATION & BEHAVIOR =======================--
+
+#define ACTIVE_DEBUG            // Enables verbose logging from key functions
+#define BLACK_FIELD 0           // Set to 1 for black dohyo, 0 for white dohyo
+#define DOUBLE_PRESS_TIMEOUT_MS 1000 // Time window for detecting double press
+// #define USE_START_STOP_MODULE   // Comment out to disable the start/stop pin check
+#define ENEMY_CONFIRMATION_THRESHOLD 7
+
+
+// --======================== TIMING & DELAY VALUES =========================--
+#define MOTOR_CONTROL_TIMER_PERIOD  15      // ms, frequency of motor updates
+#define SENSOR_READING_DELAY        10      // ms, delay in the main strategy loop
+#define LONG_PRESS_DELAY            1000    // ms, for mode selection
+#define DOUBLE_PRESS_DELAY          3000    // ms, for mode selection confirmation
+// Calibration aiming duration (ms) before switching to Hunter attack
+#define CALIBRATION_AIM_MS         800
+
+
+// --==================== MOTOR & PWM CONFIGURATION =====================--
+#define BDC_MCPWM_TIMER_RESOLUTION_HZ 1000000 // 1MHz, 1 tick = 1us
+#define BDC_MCPWM_FREQ_HZ             25000   // 25KHz PWM
+#define BDC_MCPWM_DUTY_TICK_MAX       (BDC_MCPWM_TIMER_RESOLUTION_HZ / BDC_MCPWM_FREQ_HZ)
+
+// --====================== STRATEGY TUNING CONSTANTS =======================--
+// These are used for the Proportional Control in Calibration Mode (Mode 4)
+const float Kp = 40.0;                  // Proportional Gain. Higher = faster/sharper turns.
+const int MIN_TURN_SPEED = 35;          // Minimum power to overcome motor inertia.
+const int MAX_TURN_SPEED = 80;          // Maximum power for controlled, non-overshooting turns.
+
+// --========================== GLOBAL VARIABLES ============================--
+// --- Hardware Handles ---
+bdc_motor_handle_t motor1 = NULL, motor2 = NULL;
+esp_timer_handle_t motorControlTimer = NULL;
+static const char *MAIN_TAG = "main";
+static int enemy_seen_counter = 0;
+int64_t initial_move_start_time = 0;
+int initial_move_duration_ms = 0;
+bool is_in_timed_retreat = false;
+int64_t retreat_start_time = 0;
+int64_t retreat_ignore_time = 0;
+static int64_t last_enemy_seen_time = 0;
+bool is_seen_right_line = false;
+bool is_seen_left_line = false;
+// --- Robot States ---
+// This enum defines all possible actions the robot can take.
+typedef enum {
+    PATROL, // Searching for the enemy
+    ATTACK, // Charging the enemy
+    FOUND,  // Enemy is not centered, need to turn/aim
+    IDLE,   // Stopped (either aimed, or match is over)
+    RETREAT, // Backing away from a line
+    ARCHING,  // Special state for wide arcing maneuvers
+    ARCHING_VIPER,
+    FOLLOW_LINE // <-- ADD THIS NEW STATE
+} state_t;
+
+// --- State Transfer Variables (Task -> Timer) ---
+// These variables are updated by the strategy task and read by the motor timer.
+// They are protected by the pidMutex for thread safety.
+state_t state = PATROL;
+int output = 0; // Represents motor speed (%) and turn direction (sign)
+state_t state_PID = PATROL;
+int output_PID = 0;
+
+// --- Sensor Data Variables ---
+// These hold the latest sensor readings and are protected by the sensorsMutex.
+uint8_t dist_center, dist_r90, dist_r, dist_l90, dist_l;
+#ifdef ROBOT_VECHI
+uint8_t dist_rf, dist_lf;
+#endif
+uint8_t line_right, line_left;
+
+// --- System & Mode Flags ---
+int mode = 0;
+int wing_mode = 0;
+bool is_running = false; // Controlled by the START_STOP_MODULE
+bool initial_move_done = false; // Flag to ensure opening move runs only once
+
+// --- Strategy Framework Variables ---
+// A function pointer type that defines what a "strategy" function looks like.
+typedef void (*strategy_func_t)(void);
+// A global variable to hold the function pointer of the currently selected strategy.
+strategy_func_t current_strategy = NULL;
+
+// --- RTOS Synchronization ---
+SemaphoreHandle_t sensorsMutex; // Protects access to global sensor data
+SemaphoreHandle_t pidMutex;     // Protects access to state and output variables
+
+// --===================== FORWARD DECLARATIONS =======================--
+void strategy_bulldozer(void);
+void strategy_hunter(void);
+void strategy_matador_left(void);
+void strategy_matador_right(void);
+void strategy_calibration_turn(void);
+void strategy_dash_left(void);
+void strategy_dash_right(void);
+void strategy_spiral_out(void);
+void strategy_bounce_feint(void);
+void strategy_random_micro(void);
+void strategy_prescan_aim(void);
+void strategy_staggered_burst(void);
+void run_strategy_task(void *arg);
+static void mode_select();
+static void mode_select_count();
+static void wing_select_count();
+
+// --==================== UTILITY & SETUP FUNCTIONS =====================--
+
+/**
+ * @brief Initializes all hardware peripherals (GPIO, Motors).
+ */
+static int setup() {
+    // Onboard LED for status indication
+    gpio_reset_pin(ONBOARD_LED);
+    gpio_set_direction(ONBOARD_LED, GPIO_MODE_OUTPUT);
+
+    // Input pins for sensors and buttons
+    gpio_reset_pin(MODE_BUTTON);
+    gpio_set_direction(MODE_BUTTON, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_CENTER);
+    gpio_set_direction(DIST_CENTER, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_R90);
+    gpio_set_direction(DIST_R90, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_R);
+    gpio_set_direction(DIST_R, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_L90);
+    gpio_set_direction(DIST_L90, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_L);
+    gpio_set_direction(DIST_L, GPIO_MODE_INPUT);
+    gpio_reset_pin(LINE_RIGHT);
+    gpio_set_direction(LINE_RIGHT, GPIO_MODE_INPUT);
+    gpio_reset_pin(LINE_LEFT);
+    gpio_set_direction(LINE_LEFT, GPIO_MODE_INPUT);
+
+#ifdef ROBOT_VECHI
+#ifdef USE_LATERAL_SENSORS
+    gpio_reset_pin(DIST_RF);
+    gpio_set_direction(DIST_RF, GPIO_MODE_INPUT);
+    gpio_reset_pin(DIST_LF);
+    gpio_set_direction(DIST_LF, GPIO_MODE_INPUT);
+#endif
+#endif
+
+    // --- Motor 1 (e.g., Left Motor) Initialization ---
+    ESP_LOGI(MAIN_TAG, "Create DC motors");
+    bdc_motor_config_t motor_config1 = {
+        .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
+        .pwma_gpio_num = BDC_MCPWM_GPIO_1A,
+        .pwmb_gpio_num = BDC_MCPWM_GPIO_1B,
+    };
+    bdc_motor_mcpwm_config_t mcpwm_config1 = {
+        .group_id = 0,
+        .resolution_hz = BDC_MCPWM_TIMER_RESOLUTION_HZ,
+    };
+    ESP_ERROR_CHECK(bdc_motor_new_mcpwm_device(&motor_config1, &mcpwm_config1, &motor1));
+    ESP_ERROR_CHECK(bdc_motor_enable(motor1));
+    ESP_ERROR_CHECK(bdc_motor_forward(motor1));
+
+    // --- Motor 2 (e.g., Right Motor) Initialization ---
+    bdc_motor_config_t motor_config2 = {
+        .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
+        .pwma_gpio_num = BDC_MCPWM_GPIO_2A,
+        .pwmb_gpio_num = BDC_MCPWM_GPIO_2B,
+    };
+    bdc_motor_mcpwm_config_t mcpwm_config2 = {
+        .group_id = 0,
+        .resolution_hz = BDC_MCPWM_TIMER_RESOLUTION_HZ,
+    };
+    ESP_ERROR_CHECK(bdc_motor_new_mcpwm_device(&motor_config2, &mcpwm_config2, &motor2));
+    ESP_ERROR_CHECK(bdc_motor_enable(motor2));
+    ESP_ERROR_CHECK(bdc_motor_forward(motor2));
+    
+    return 0;
+}
+
+/**
+ * @brief Converts a percentage value (0-100) to a motor duty cycle value.
+ */
+int percent_to_duty_cycle(int percent) {
+    return (percent * BDC_MCPWM_DUTY_TICK_MAX) / 100;
+}
+
+// Clamp a percentage value to the valid 0..100 range
+static int clamp_percent_0_100(int p) {
+    if (p < 0) return 0;
+    if (p > 100) return 100;
+    return p;
+}
+
+/**
+ * @brief Blinks the onboard LED a specified number of times.
+ */
+void blink_led(int cnt, int delay) {
+    for (int i = 0; i < cnt; i++) {
+        gpio_set_level(ONBOARD_LED, 1);
+        vTaskDelay(delay / portTICK_PERIOD_MS);
+        gpio_set_level(ONBOARD_LED, 0);
+        vTaskDelay(delay / portTICK_PERIOD_MS);
+    }
+}
+
+// --==================== SENSOR & STATE LOGIC ======================--
+
+/**
+ * @brief Reads all digital sensors and updates global variables safely.
+ */
+void read_sensors() {
+    // Read all sensor values into local variables first
+    uint8_t dist_center_local = gpio_get_level(DIST_CENTER);
+    uint8_t dist_r90_local = gpio_get_level(DIST_R90);
+    uint8_t dist_r_local = gpio_get_level(DIST_R);
+    uint8_t dist_l90_local = gpio_get_level(DIST_L90);
+    uint8_t dist_l_local = gpio_get_level(DIST_L);
+
+#ifdef ROBOT_VECHI
+#ifdef USE_LATERAL_SENSORS
+    // Optional: Use front sensors to enhance detection (e.g., dist_rf, dist_l
+    uint8_t dist_rf_local = gpio_get_level(DIST_RF);
+    uint8_t dist_lf_local = gpio_get_level(DIST_LF);
+#endif
+#endif
+
+    // IMPORTANT: This logic assumes your line sensor outputs HIGH (1) on a white line.
+    // If your sensor is inverted (outputs LOW on white), change this to !gpio_get_level().
+#ifdef BLACK_FIELD
+    uint8_t line_right_local = !gpio_get_level(LINE_RIGHT);
+    uint8_t line_left_local = !gpio_get_level(LINE_LEFT);
+#else
+    uint8_t line_right_local = gpio_get_level(LINE_RIGHT);
+    uint8_t line_left_local = gpio_get_level(LINE_LEFT);
+#endif
+
+    // Use a mutex to safely update the global variables
+    if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        dist_center = dist_center_local;
+        dist_r90 = dist_r90_local;
+        dist_r = dist_r_local;
+        dist_l90 = dist_l90_local;
+        dist_l = dist_l_local;
+        line_right = line_right_local;
+        line_left = line_left_local;
+#ifdef ROBOT_VECHI
+#ifdef USE_LATERAL_SENSORS
+        dist_rf = dist_rf_local;
+        dist_lf = dist_lf_local;
+#endif
+#endif
+        xSemaphoreGive(sensorsMutex);
+    }
+
+    // log sensor data
+#ifdef ACTIVE_DEBUG
+    // ESP_LOGI("Sensors", "DC:%d R90:%d R:%d L90:%d L:%d LR:%d LL:%d",
+    //          dist_center, dist_r90, dist_r, dist_l90, dist_l,
+    //          line_right, line_left);
+#ifdef ROBOT_VECHI
+    ESP_LOGI("Sensors", "RF:%d LF:%d", dist_rf, dist_lf);
+#endif
+#endif
+}
+
+// --========================= STRATEGY MODES =========================--
+
+/**
+ * @brief STRATEGY 1: Pure aggression with debouncing. Confirms a target's
+ *        presence before launching a full-power attack.
+ */
+void strategy_bulldozer(void) {
+    // --- Initial Move: A timed, full-speed blitz forward ---
+    if (!initial_move_done) {
+        ESP_LOGI("Bulldozer", "Executing initial blitz!");
+        state_PID = ATTACK;
+        output_PID = 100;
+        
+        // servo_set_angle(175);
+        // ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, 2000);
+        // ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+    }
+    else strategy_hunter();
+}
+
+
+/**
+ * @brief STRATEGY 2: A debounced hunter that confirms targets before aiming
+ *        and attacking.
+ */
+void strategy_hunter(void) {
+    // --- Initial Move: A quick scan to find opponents not in the center ---
+    if (!initial_move_done) {
+        ESP_LOGI("Hunter", "Executing initial scan...");
+        state_PID = FOUND;
+        output_PID = -70; // Turn left
+    }
+    
+    else {
+        read_sensors();
+
+        // --- Debouncing Logic ---
+        bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+            || dist_rf || dist_lf
+        #endif
+        #endif
+        );
+
+        if (is_enemy_present) {
+            if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
+                enemy_seen_counter++;
+            }
+        } else {
+            enemy_seen_counter = 0; // Reset counter if enemy is lost
+        }
+        // --- End Debouncing Logic ---
+
+
+        // Only aim/attack if the enemy presence is CONFIRMED.
+        if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) {
+            // Now we are CONFIRMED. We can use the aiming/attack logic.
+            if (dist_center && dist_l && dist_r) {
+                state_PID = ATTACK;
+                output_PID = 100;
+            } else if (dist_l90 || dist_l
+            #ifdef ROBOT_VECHI
+            #ifdef USE_LATERAL_SENSORS
+                || dist_lf
+            #endif
+            #endif
+            ) {
+                state_PID = FOUND;
+                output_PID = -70; // Turn left
+            } else if (dist_r90 || dist_r
+            #ifdef ROBOT_VECHI
+            #ifdef USE_LATERAL_SENSORS
+                || dist_rf
+            #endif
+            #endif
+            ) {
+                state_PID = FOUND;
+                output_PID = 70; // Turn right
+            }
+        } else {
+            // If not confirmed, continue patrolling.
+            state_PID = PATROL;
+            output_PID = PATROL_SPEED;
+        }
+    }
+}
+
+
+/**
+ * @brief STRATEGY 3: Dodge and Counter. A sample strategy that tries to
+ *        evade an initial rush and attack from the side.
+ */
+void strategy_matador_left(void) {
+    // --- Initial Move: A wide, fast, parabolic arc to the LEFT ---
+    if (!initial_move_done) {
+        ESP_LOGI("MatadorL", "Executing parabolic evade (LEFT)...");
+        state_PID = ARCHING;
+        // Negative output = arc LEFT
+        output_PID = -ARCING_SPEED;
+        return;
+    }
+    // After the initial evade, behave like Hunter.
+    else strategy_hunter();
+}
+
+void strategy_matador_right(void) {
+    // --- Initial Move: A wide, fast, parabolic arc to the RIGHT ---
+    if (!initial_move_done) {
+        ESP_LOGI("MatadorR", "Executing parabolic evade (RIGHT)...");
+        state_PID = ARCHING;
+        // Positive output = arc RIGHT
+        output_PID = ARCING_SPEED;
+        return;
+    }
+    // After the initial evade, behave like Hunter.
+    else strategy_hunter();
+}
+
+
+/**
+ * @brief STRATEGY 4: Calibration Mode with debouncing. Confirms a target
+ *        before rotating to aim, preventing reactions to noise.
+ */
+void strategy_calibration_turn(void) {
+    read_sensors();
+
+    // --- Debouncing Logic ---
+    bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
+    #ifdef ROBOT_VECHI
+    #ifdef USE_LATERAL_SENSORS
+        || dist_rf || dist_lf
+    #endif
+    #endif
+    );
+
+    if (is_enemy_present) {
+        if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
+            enemy_seen_counter++;
+        }
+    } else {
+        enemy_seen_counter = 0; // Reset counter if enemy is lost
+    }
+    // --- End Debouncing Logic ---
+
+    // Timed calibration aiming: start a short aiming phase, then switch to Hunter
+    static int calibrating = 0;
+    static int64_t calibrate_start = 0;
+    int64_t now = esp_timer_get_time();
+
+    // Start or continue calibration if we have a confirmed sighting (or already calibrating)
+    if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD || calibrating) {
+        if (!calibrating) {
+            calibrating = 1;
+            calibrate_start = now;
+            ESP_LOGI("Calibration", "Starting timed calibration aiming for %d ms", CALIBRATION_AIM_MS);
+        }
+
+        float error = 0.0;
+
+        // 1. Calculate the error based on which sensor is active
+        if (dist_center)       { error = 0.0; }
+        else if (dist_l90)     { error = -2.0;}
+        else if (dist_l)       { error = -1.0;}
+        else if (dist_r90)     { error = 2.0; }
+        else if (dist_r)       { error = 1.0; }
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+        else if (dist_lf)      { error = -0.5;}
+        else if (dist_rf)      { error = 0.5; }
+        #endif
+        #endif
+
+        // 2. Decide the action based on the error
+        if (error == 0.0) {
+            state_PID = IDLE; // We are aimed, so stop.
+            output_PID = 0;
+        } else {
+            state_PID = FOUND; // We need to turn.
+
+            // 3. Calculate turn speed using Proportional Control
+            int turn_speed = (int)(Kp * fabs(error));
+
+            // 4. Clamp the speed
+            if (turn_speed < MIN_TURN_SPEED) turn_speed = MIN_TURN_SPEED;
+            if (turn_speed > MAX_TURN_SPEED) turn_speed = MAX_TURN_SPEED;
+
+            // 5. Set final output
+            output_PID = (error < 0) ? -turn_speed : turn_speed;
+        }
+
+        // Check calibration duration
+        int64_t elapsed_ms = (now - calibrate_start) / 1000;
+        if (elapsed_ms >= CALIBRATION_AIM_MS) {
+            calibrating = 0;
+            ESP_LOGI("Calibration", "Calibration complete - switching to Hunter (attack)");
+            current_strategy = &strategy_hunter;
+            initial_move_done = false;
+            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+            return;
+        }
+    } else {
+        // If not confirmed and not calibrating, stay idle.
+        calibrating = 0;
+        state_PID = IDLE;
+        output_PID = 0;
+    }
+}
+
+/* Edge walker removed per request. */
+
+/**
+ * @brief STRATEGY 6: Uses wide arcs to flank and circle opponents when
+ *        detected on side sensors, rather than turning in place.
+ */
+void strategy_viper(void) {
+    /*
+     * Viper with a short pre-turn phase: when a side sensor detects the
+     * opponent (and center does not), first do a brief in-place turn toward
+     * that side, then transition into an arch toward the opposite side to
+     * gain a better attack angle.
+     */
+    read_sensors();
+
+    // Standard debouncing logic.
+    bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
+    #ifdef ROBOT_VECHI
+    #ifdef USE_LATERAL_SENSORS
+        || dist_rf || dist_lf
+    #endif
+    #endif
+    );
+    if (is_enemy_present) {
+        if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) enemy_seen_counter++;
+    } else {
+        enemy_seen_counter = 0;
+    }
+    int64_t now = esp_timer_get_time();
+
+    // small state machine for pre-turn -> arch
+    static int viper_phase = 0; // 0=idle, 1=pre-turn, 2=arching
+    static int8_t viper_arch_dir = 0; // +1 = arc RIGHT, -1 = arc LEFT
+    static int64_t viper_phase_start = 0;
+    static int64_t viper_phase_arch_start = 0;
+    static int64_t viper_hold_until = 0; // microseconds until which we hold attack/arch
+    const int VIPER_HOLD_MS = 300; // ms to hold attack/arch to avoid flicker interruptions
+
+    bool confirmed = (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) || (now < viper_hold_until);
+
+    if (confirmed) {
+        // Immediate, highest-priority: full-frontal
+        if (dist_center && dist_l && dist_r) {
+            viper_phase = 0;
+            state_PID = ATTACK;
+            output_PID = 100;
+            viper_hold_until = now + (VIPER_HOLD_MS * 1000);
+            // ESP_LOGI("Viper", "Full frontal attack");
+            return;
+        }
+
+        int64_t now = esp_timer_get_time();
+
+        // If left side sees (without center), do pre-turn left then arch RIGHT
+        // NOTE: do NOT include the 90deg sensor here — 90deg should only trigger a turn
+        if (dist_l
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+            || dist_lf
+        #endif
+        #endif
+        ) {
+            // start pre-turn if idle
+            if (viper_phase == 0) {
+                viper_phase = 1;
+                viper_arch_dir = 1; // will arc RIGHT after pre-turn
+                viper_phase_start = now;
+                state_PID = FOUND; output_PID = -VIPER_RETURN_SPEED; // small turn LEFT
+                // ESP_LOGI("Viper", "Pre-turn LEFT started (will arc RIGHT)");
+                return;
+            }
+
+            // during pre-turn
+            if (viper_phase == 1) {
+                int64_t elapsed = (now - viper_phase_start) / 1000;
+                // if center appears mid-preturn -> immediate attack
+                // if (dist_center) { viper_phase = 0; state_PID = ATTACK; output_PID = 100; ESP_LOGI("Viper","Center seen during pre-turn -> ATTACK"); return; }
+                if (elapsed < VIPER_PRETURN_MS) {
+                    state_PID = FOUND; output_PID = VIPER_RETURN_SPEED; // keep turning left
+                    return;
+                } else {
+                    viper_phase = 2; // move to arching
+                    viper_phase_arch_start = now;
+                    state_PID = ARCHING_VIPER; output_PID = VIPER_ARCING_SPEED;
+                    viper_hold_until = now + (VIPER_HOLD_MS * 1000);
+                    // ESP_LOGI("Viper","Pre-turn complete -> ARCH RIGHT");
+                    return;
+                }
+            }
+
+            // arching phase
+            if (viper_phase == 2) {
+                int64_t elapsed = (now - viper_phase_arch_start) / 1000;
+                // if (dist_center) { viper_phase = 0; state_PID = ATTACK; output_PID = 100; ESP_LOGI("Viper","Center seen during arch -> ATTACK"); return; }
+                if (elapsed < VIPER_ARCH_MS) {
+                    state_PID = ARCHING_VIPER; output_PID = VIPER_ARCING_SPEED; return;
+                } else {
+                    viper_phase = 0; // finished arching
+                    // ESP_LOGI("Viper","Arch complete -> reset to idle");
+                    // fallthrough to other logic
+                }
+            }
+        }
+
+        // If right side sees (without center), do pre-turn right then arch LEFT
+        // NOTE: do NOT include the 90deg sensor here — 90deg should only trigger a turn
+        if (dist_r
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+            || dist_rf
+        #endif
+        #endif
+        ) {
+            if (viper_phase == 0) {
+                viper_phase = 1;
+                viper_arch_dir = -1; // will arc LEFT after pre-turn
+                viper_phase_start = now;
+                state_PID = FOUND; output_PID = VIPER_RETURN_SPEED; // small turn RIGHT
+                // ESP_LOGI("Viper", "Pre-turn RIGHT started (will arc LEFT)");
+                return;
+            }
+
+            if (viper_phase == 1) {
+                int64_t elapsed = (now - viper_phase_start) / 1000;
+                // if (dist_center) { viper_phase = 0; state_PID = ATTACK; output_PID = 100; ESP_LOGI("Viper","Center seen during pre-turn -> ATTACK"); return; }
+                if (elapsed < VIPER_PRETURN_MS) {
+                    state_PID = FOUND; output_PID = -VIPER_RETURN_SPEED; // keep turning right
+                    return;
+                } else {
+                    viper_phase = 2;
+                    viper_phase_arch_start = now;
+                    state_PID = ARCHING_VIPER; output_PID = -VIPER_ARCING_SPEED;
+                    viper_hold_until = now + (VIPER_HOLD_MS * 1000);
+                    // ESP_LOGI("Viper","Pre-turn complete -> ARCH LEFT");
+                    return;
+                }
+            }
+
+            if (viper_phase == 2) {
+                int64_t elapsed = (now - viper_phase_arch_start) / 1000;
+                if (elapsed < VIPER_ARCH_MS) {
+                    state_PID = ARCHING_VIPER; output_PID = -VIPER_ARCING_SPEED; return;
+                } else {
+                    viper_phase = 0;
+                    ESP_LOGI("Viper","Arch complete -> reset to idle");
+                    // fallthrough to other logic
+                }
+            }
+        }
+
+        // Fallback: if only a 90-degree sensor sees, rotate in place toward them
+        if (dist_l90 && !dist_center) { viper_phase = 0; state_PID = FOUND; output_PID = -70; return; }
+        if (dist_r90 && !dist_center) { viper_phase = 0; state_PID = FOUND; output_PID = 70; return; }
+
+        // If nothing matched, keep patrolling
+        viper_phase = 0;
+        state_PID = PATROL;
+        output_PID = 50;
+    } else {
+        // No confirmed enemy: reset phase and patrol
+        viper_phase = 0;
+        state_PID = PATROL;
+        output_PID = 50;
+    }
+}
+
+/**
+ * @brief STRATEGY 7: Starts as a standard hunter, but if no opponent is found
+ *        for a set time, it switches to a fast, aggressive patrol pattern.
+ */
+void strategy_adaptive_hunter(void) {
+    if (!initial_move_done) {
+        // Standard Hunter initial scan.
+        state_PID = FOUND;
+        output_PID = -70;
+        return;
+    }
+    
+    // Initialize the timer the first time this runs post-initial move.
+    if (last_enemy_seen_time == 0) {
+        last_enemy_seen_time = esp_timer_get_time();
+    }
+    
+    read_sensors();
+
+    // Standard debouncing.
+    bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
+    #ifdef ROBOT_VECHI
+    #ifdef USE_LATERAL_SENSORS
+        || dist_rf || dist_lf
+    #endif
+    #endif
+    );
+    if (is_enemy_present) {
+        if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) enemy_seen_counter++;
+        // As soon as we see an enemy, reset the timer!
+        last_enemy_seen_time = esp_timer_get_time();
+    } else {
+        enemy_seen_counter = 0;
+    }
+
+    // --- Main Logic ---
+    if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) {
+        // If enemy is confirmed, behave like a normal Hunter.
+        if (dist_center) {
+            state_PID = ATTACK;
+            output_PID = 100;
+        } else if (dist_l90 || dist_l
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+            || dist_lf
+        #endif
+        #endif
+        ) {
+            state_PID = FOUND;
+            output_PID = -70;
+        } else if (dist_r90 || dist_r
+        #ifdef ROBOT_VECHI
+        #ifdef USE_LATERAL_SENSORS
+            || dist_rf
+        #endif
+        #endif
+        ) {
+            state_PID = FOUND;
+            output_PID = 70;
+        }
+    } else {
+        // If no confirmed enemy, check the timer.
+        int64_t time_since_last_seen = (esp_timer_get_time() - last_enemy_seen_time) / 1000;
+        
+        if (time_since_last_seen > ADAPTIVE_TIMEOUT_MS) {
+            // ADAPTIVE SWITCH: It's been too long. Go aggressive!
+            state_PID = PATROL;
+            output_PID = 70; // High-speed aggressive search
+        } else {
+            // It hasn't been long, so do a normal, careful search.
+            state_PID = PATROL;
+            output_PID = 50;
+        }
+    }
+}
+
+/**
+ * @brief STRATEGY X: Dash-then-pivot-then-dash (LEFT).
+ *        Straight burst, 90deg pivot left in place, then fast straight dash.
+ */
+void strategy_dash_left(void) {
+    if (initial_move_done) {
+        // After the dash sequence, behave like a hunter/patrol
+        state_PID = PATROL;
+        output_PID = PATROL_SPEED;
+        return;
+    }
+
+    static int stage = 0; // 0=not started,1=pre-straight,2=turn,3=post-straight,4=done
+    static int64_t stage_start = 0;
+    const int pre_straight_ms = 150;
+    const int turn_ms = 300; // tune to achieve approx 90deg
+    const int post_straight_ms = 175;
+
+    if (stage == 0) {
+        stage = 1;
+        stage_start = esp_timer_get_time();
+        ESP_LOGI("DashL", "Starting dash-left sequence");
+    }
+
+    int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
+    if (stage == 1) {
+        // initial straight burst
+        state_PID = ATTACK;
+        output_PID = 100;
+        if (elapsed >= pre_straight_ms) {
+            stage = 2;
+            stage_start = esp_timer_get_time();
+        }
+    } else if (stage == 2) {
+        // pivot left in place
+        state_PID = FOUND;
+        output_PID = -100; // rotate left at max
+        if (elapsed >= turn_ms) {
+            stage = 3;
+            stage_start = esp_timer_get_time();
+        }
+    } else if (stage == 3) {
+        // post-turn dash
+        state_PID = ATTACK;
+        output_PID = 100;
+        if (elapsed >= post_straight_ms) {
+            stage = 4;
+            // After finishing the dash sequence, switch to Hunter strategy
+            ESP_LOGI("DashL", "Dash-left complete. Switching to Hunter.");
+            current_strategy = &strategy_hunter;
+            // Allow the Hunter to perform its own initial timed initial move
+            initial_move_done = false;
+            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+        }
+    }
+}
+
+/**
+ * @brief STRATEGY X: Dash-then-pivot-then-dash (RIGHT).
+ */
+void strategy_dash_right(void) {
+    if (initial_move_done) {
+        state_PID = PATROL;
+        output_PID = PATROL_SPEED;
+        return;
+    }
+
+    static int stage = 0;
+    static int64_t stage_start = 0;
+    const int pre_straight_ms = 150;
+    const int turn_ms = 320; // tune to achieve approx 90deg
+    const int post_straight_ms = 175;
+
+    if (stage == 0) {
+        stage = 1;
+        stage_start = esp_timer_get_time();
+        ESP_LOGI("DashR", "Starting dash-right sequence");
+    }
+
+    int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
+    if (stage == 1) {
+        state_PID = ATTACK;
+        output_PID = 100;
+        if (elapsed >= pre_straight_ms) {
+            stage = 2;
+            stage_start = esp_timer_get_time();
+        }
+    } else if (stage == 2) {
+        state_PID = FOUND;
+        output_PID = 100; // rotate right at max
+        if (elapsed >= turn_ms) {
+            stage = 3;
+            stage_start = esp_timer_get_time();
+        }
+    } else if (stage == 3) {
+        state_PID = ATTACK;
+        output_PID = 100;
+        if (elapsed >= post_straight_ms) {
+            stage = 4;
+            // After finishing the dash sequence, switch to Hunter strategy
+            ESP_LOGI("DashR", "Dash-right complete. Switching to Hunter.");
+            current_strategy = &strategy_hunter;
+            // Allow the Hunter to perform its own initial timed initial move
+            initial_move_done = false;
+            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+        }
+    }
+
+}
+
+/**
+ * @brief STRATEGY X: Spiral-out scan. Starts tight and opens the arc over time
+ * to sweep a larger area, then hands off to Hunter.
+ */
+void strategy_spiral_out(void) {
+    if (initial_move_done) {
+        state_PID = PATROL;
+        output_PID = PATROL_SPEED;
+        return;
+    }
+
+    static int stage = 0;
+    static int64_t start = 0;
+    const int duration_ms = 1200;
+
+    if (stage == 0) {
+        stage = 1;
+        start = esp_timer_get_time();
+        ESP_LOGI("Spiral", "Starting spiral-out scan");
+    }
+
+    int64_t elapsed = (esp_timer_get_time() - start) / 1000;
+    if (elapsed < duration_ms) {
+        // Increase arc magnitude over time to spiral outward
+        int mag = 30 + (int)((float)elapsed * (70.0f / duration_ms));
+        if (mag > 100) mag = 100;
+        state_PID = ARCHING;
+        // make it alternate directions each run to avoid predictable pattern
+    if ((rand() & 1) == 0) output_PID = mag;
+    else output_PID = -mag;
+    } else {
+        stage = 2;
+        ESP_LOGI("Spiral", "Spiral complete. Switching to Hunter.");
+        current_strategy = &strategy_hunter;
+        initial_move_done = false;
+        initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+    }
+}
+
+/**
+ * @brief STRATEGY X: Bounce & Feint. Forward burst, quick in-place turn, forward.
+ */
+void strategy_bounce_feint(void) {
+    if (initial_move_done) {
+        state_PID = PATROL;
+        output_PID = PATROL_SPEED;
+        return;
+    }
+
+    static int stage = 0;
+    static int64_t stage_start = 0;
+    const int forward_ms = 150;
+    const int turn_ms = 300;
+    const int forward2_ms = 200;
+
+    if (stage == 0) { stage = 1; stage_start = esp_timer_get_time(); ESP_LOGI("Bounce", "Starting bounce-feint"); }
+    int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
+
+    if (stage == 1) {
+        state_PID = ATTACK; output_PID = 100; // forward burst
+        if (elapsed >= forward_ms) { stage = 2; stage_start = esp_timer_get_time(); }
+    } else if (stage == 2) {
+    state_PID = FOUND; output_PID = (rand() & 1) ? 100 : -100; // quick in-place turn random dir
+        if (elapsed >= turn_ms) { stage = 3; stage_start = esp_timer_get_time(); }
+    } else if (stage == 3) {
+        state_PID = ATTACK; output_PID = 100; // second forward
+        if (elapsed >= forward2_ms) {
+            stage = 4;
+            ESP_LOGI("Bounce", "Bounce complete. Switching to Hunter.");
+            current_strategy = &strategy_hunter;
+            initial_move_done = false;
+            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+        }
+    }
+}
+
+/**
+ * @brief STRATEGY X: Randomized micro-movements to be unpredictable.
+ */
+void strategy_random_micro(void) {
+    if (initial_move_done) {
+        state_PID = PATROL; output_PID = PATROL_SPEED; return;
+    }
+
+    static int steps = 0;
+    static int idx = 0;
+    static int64_t start = 0;
+    const int step_ms = 200;
+
+    if (steps == 0) {
+    steps = 3 + (rand() % 4); // 3..6 micro moves
+        idx = 0;
+        start = esp_timer_get_time();
+        ESP_LOGI("RandMicro", "Starting %d micro moves", steps);
+    }
+
+    int64_t elapsed = (esp_timer_get_time() - start) / 1000;
+    if (idx < steps) {
+        if (elapsed >= step_ms) {
+            // pick new micro move
+            int r = rand();
+            int choice = r % 3;
+            if (choice == 0) { state_PID = FOUND; output_PID = -40; }
+            else if (choice == 1) { state_PID = FOUND; output_PID = 40; }
+            else { state_PID = ATTACK; output_PID = 30; }
+            idx++;
+            start = esp_timer_get_time();
+        }
+    } else {
+        ESP_LOGI("RandMicro", "Micro moves complete. Switching to Hunter.");
+        steps = 0;
+        idx = 0;
+        current_strategy = &strategy_hunter;
+        initial_move_done = false;
+        initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+    }
+}
+
+/**
+ * @brief STRATEGY X: Prescan aiming. Slowly rotate and sample center sensor.
+ * If a target is seen during the scan, switch to calibration aiming.
+ */
+void strategy_prescan_aim(void) {
+    static int stage = 0;
+    static int64_t start = 0;
+    const int scan_ms = 1200;
+
+    if (initial_move_done) {
+        state_PID = IDLE; output_PID = 0; return;
+    }
+
+    if (stage == 0) { stage = 1; start = esp_timer_get_time(); ESP_LOGI("PreScan", "Starting prescan aim"); }
+
+    int64_t elapsed = (esp_timer_get_time() - start) / 1000;
+    // rotate slowly left while scanning
+    state_PID = FOUND; output_PID = -30;
+    read_sensors();
+    if (dist_center) {
+        ESP_LOGI("PreScan", "Target seen during prescan - switching to Calibration");
+        current_strategy = &strategy_calibration_turn;
+        // keep initial_move_done false so calibration can perform its aiming
+        initial_move_done = false;
+        return;
+    }
+
+    if (elapsed >= scan_ms) {
+        ESP_LOGI("PreScan", "Prescan timeout - switching to Hunter");
+        current_strategy = &strategy_hunter;
+        initial_move_done = false;
+        stage = 0;
+    }
+}
+
+/**
+ * @brief STRATEGY X: Staggered burst - multiple short pulses with small breaks.
+ */
+void strategy_staggered_burst(void) {
+    if (initial_move_done) { state_PID = PATROL; output_PID = PATROL_SPEED; return; }
+
+    static int pulse = 0;
+    static int64_t start = 0;
+    const int on_ms = 80;
+    const int off_ms = 60;
+    const int pulses_total = 3;
+
+    if (pulse == 0) { pulse = 1; start = esp_timer_get_time(); ESP_LOGI("Stagger", "Starting staggered burst"); }
+
+    int64_t elapsed = (esp_timer_get_time() - start) / 1000;
+    int phase = (pulse % 2 == 1) ? 1 : 0; // odd pulses -> ON phase
+
+    if (phase == 1) {
+        // ON
+        state_PID = ATTACK; output_PID = 100;
+        if (elapsed >= on_ms) { start = esp_timer_get_time(); pulse++; }
+    } else {
+        // OFF (small brake)
+        state_PID = IDLE; output_PID = 0;
+        if (elapsed >= off_ms) { start = esp_timer_get_time(); pulse++; }
+    }
+
+    if (pulse > pulses_total * 2) {
+        ESP_LOGI("Stagger", "Staggered burst complete. Switching to Hunter.");
+        pulse = 0;
+        current_strategy = &strategy_hunter;
+        initial_move_done = false;
+        initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+    }
+}
+
+// --====================== CORE TASK & TIMER =======================--
+
+/**
+ * @brief The "Brain" of the robot. This generic task manages the timing for
+ *        any initial move AND for timed retreats, then executes the strategy.
+ */
+void run_strategy_task(void *arg) {
+    bool initial_move_timer_started = false;
+
+    while (1) {
+        if (is_running && current_strategy != NULL) {
+            
+            // --- PRIORITY 1: Handle Timed Retreats ---
+            if (is_in_timed_retreat) {
+                // If we are currently in a retreat, our only job is to check the timer.
+                int64_t elapsed_retreat_time = (esp_timer_get_time() - retreat_start_time) / 1000;
+
+                if (elapsed_retreat_time < RETREAT_DURATION_MS) {
+                    // Timer has not expired, so we MUST continue retreating.
+                    state_PID = RETREAT;
+                } else {
+                    // Time's up! The retreat is over.
+                    is_in_timed_retreat = false;
+                    // Now we can fall through to let the strategy decide what's next.
+                }
+            }
+
+            // --- PRIORITY 2: If not in a timed retreat, run normal logic ---
+            if (!is_in_timed_retreat) {
+                // Read sensors to make a fresh decision
+                read_sensors();
+                int64_t elapsed_retreat_ignore_time = (esp_timer_get_time() - retreat_ignore_time) / 1000;
+
+                // Check for a NEW line detection
+                if ((line_left || line_right) && (elapsed_retreat_ignore_time > RETREAT_IGNORE_MS)) {
+                    if (line_left) {
+                        is_seen_left_line = true;
+                        is_seen_right_line = false;
+                    } else {
+                        is_seen_right_line = true;
+                        is_seen_left_line = false;
+                    }
+                    // Start a new timed retreat
+                    is_in_timed_retreat = true;
+                    retreat_start_time = esp_timer_get_time();
+                    elapsed_retreat_ignore_time = esp_timer_get_time();
+                    state_PID = RETREAT;
+                } else {
+                    // No line detected, so run the currently selected strategy
+                    // Note: The strategies no longer need to check for lines.
+                    current_strategy();
+                }
+            }
+            
+            // --- Generic Initial Move Timing Logic (un-related to retreat) ---
+            if (!initial_move_done && initial_move_duration_ms > 0) {
+                if (!initial_move_timer_started) {
+                    initial_move_start_time = esp_timer_get_time();
+                    initial_move_timer_started = true;
+                }
+                int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
+                if (elapsed_time_ms >= initial_move_duration_ms) {
+                    initial_move_done = true;
+                }
+            }
+
+        } else {
+            state_PID = IDLE;
+            output_PID = 0;
+        }
+
+        // Safely post the final decision for the motor controller
+        if (xSemaphoreTake(pidMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            state = state_PID;
+            output = output_PID;
+            xSemaphoreGive(pidMutex);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_READING_DELAY));
+    }
+}
+
+/**
+ * @brief The "Muscle" of the robot. This high-frequency timer callback reads
+ *        the global state and output, and translates them into physical
+ *        motor actions. It does not contain complex logic, it just executes.
+ */
+void motor_controller_callback(void *arg) {
+    #ifdef USE_START_STOP_MODULE
+    if (!gpio_get_level(START_STOP_MODULE)) {
+        is_running = false; // The main task will see this and go idle
+    }
+    #endif
+
+    // If the robot is not running, brake the motors and do nothing else.
+    if (!is_running) {
+        bdc_motor_brake(motor1);
+        bdc_motor_brake(motor2);
+        return;
+    }
+    
+    // Safely copy the global state and output into local variables
+    state_t local_state;
+    int local_output;
+    if (xSemaphoreTake(pidMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        local_state = state;
+        local_output = output;
+        xSemaphoreGive(pidMutex);
+    } else {
+        // If we fail to get the mutex, brake for safety and exit.
+        bdc_motor_brake(motor1);
+        bdc_motor_brake(motor2);
+        return;
+    }
+
+    // --- Execute Actions Based on State ---
+    switch (local_state) {
+        case PATROL:
+        case ATTACK:
+            bdc_motor_forward(motor1);
+            bdc_motor_forward(motor2);
+            {
+                int left_percent = (int)((float)local_output * LEFT_MOTOR_MULTIPLIER);
+                int right_percent = (int)((float)local_output * RIGHT_MOTOR_MULTIPLIER);
+                left_percent = clamp_percent_0_100(left_percent);
+                right_percent = clamp_percent_0_100(right_percent);
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+            }
+            break;
+
+        case FOUND:
+            {
+                int out_abs = abs(local_output); // Use absolute value for speed
+                int left_percent = (int)((float)out_abs * LEFT_MOTOR_MULTIPLIER);
+                int right_percent = (int)((float)out_abs * RIGHT_MOTOR_MULTIPLIER);
+                left_percent = clamp_percent_0_100(left_percent);
+                right_percent = clamp_percent_0_100(right_percent);
+
+                if (output < 0) { // Negative output means turn LEFT
+                    bdc_motor_reverse(motor1);
+                    bdc_motor_forward(motor2);
+                } else { // Positive output means turn RIGHT
+                    bdc_motor_forward(motor1);
+                    bdc_motor_reverse(motor2);
+                }
+
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+            }
+            break;
+
+        case ARCHING:
+            // Both motors go forward, but at different speeds to create an arc.
+            bdc_motor_forward(motor1);
+            bdc_motor_forward(motor2);
+
+            // A positive output will mean an arc to the RIGHT.
+            // This makes the left motor (motor1) faster.
+            // The ratio (e.g., 0.5) controls how tight the arc is.
+            // A smaller ratio (0.3) = a tighter turn. A larger ratio (0.7) = a wider turn.
+            {
+                int base = abs(local_output);
+                if (local_output > 0) { // Arc RIGHT
+                    int left_percent = (int)((float)base * LEFT_MOTOR_MULTIPLIER);
+                    int right_percent = (int)((float)base * 0.68f * RIGHT_MOTOR_MULTIPLIER);
+                    left_percent = clamp_percent_0_100(left_percent);
+                    right_percent = clamp_percent_0_100(right_percent);
+                    bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                    bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+                    ESP_LOGI("motor_timer", "Arc RIGHT: M1 Speed=%d, M2 Speed=%d",
+                             left_percent,
+                             right_percent);
+                } else { // Arc LEFT (negative output)
+                    int left_percent = (int)((float)base * 0.68f * LEFT_MOTOR_MULTIPLIER);
+                    int right_percent = (int)((float)base * RIGHT_MOTOR_MULTIPLIER);
+                    left_percent = clamp_percent_0_100(left_percent);
+                    right_percent = clamp_percent_0_100(right_percent);
+                    bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                    bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+                    ESP_LOGI("motor_timer", "Arc LEFT: M1 Speed=%d, M2 Speed=%d",
+                             left_percent,
+                             right_percent);
+                }
+            }
+            break;
+        case ARCHING_VIPER:
+            // Both motors go forward, but at different speeds to create an arc.
+            bdc_motor_forward(motor1);
+            bdc_motor_forward(motor2);
+
+            // A positive output will mean an arc to the RIGHT.
+            // This makes the left motor (motor1) faster.
+            // The ratio (e.g., 0.5) controls how tight the arc is.
+            // A smaller ratio (0.3) = a tighter turn. A larger ratio (0.7) = a wider turn.
+            {
+                int base = abs(local_output);
+                if (local_output > 0) { // Arc RIGHT
+                    int left_percent = (int)((float)base * LEFT_MOTOR_MULTIPLIER);
+                    int right_percent = (int)((float)base * 0.55f * RIGHT_MOTOR_MULTIPLIER);
+                    left_percent = clamp_percent_0_100(left_percent);
+                    right_percent = clamp_percent_0_100(right_percent);
+                    bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                    bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+                    ESP_LOGI("motor_timer", "Arc RIGHT: M1 Speed=%d, M2 Speed=%d",
+                             left_percent,
+                             right_percent);
+                } else { // Arc LEFT (negative output)
+                    int left_percent = (int)((float)base * 0.55f * LEFT_MOTOR_MULTIPLIER);
+                    int right_percent = (int)((float)base * RIGHT_MOTOR_MULTIPLIER);
+                    left_percent = clamp_percent_0_100(left_percent);
+                    right_percent = clamp_percent_0_100(right_percent);
+                    bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                    bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+                    ESP_LOGI("motor_timer", "Arc LEFT: M1 Speed=%d, M2 Speed=%d",
+                             left_percent,
+                             right_percent);
+                }
+            }
+            break;
+
+
+        case FOLLOW_LINE: {
+            // This state keeps the robot moving along the edge of the dohyo.
+            // Both motors move forward, but we adjust speed to keep the line sensor
+            // just on the edge of the line.
+            bdc_motor_forward(motor1);
+            bdc_motor_forward(motor2);
+
+            uint8_t local_line_left = 0, local_line_right = 0;
+            if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                local_line_left = line_left;
+                local_line_right = line_right;
+                xSemaphoreGive(sensorsMutex);
+            }
+
+            const int follow_speed_fast = 30;
+            const int follow_speed_slow = 20;
+
+            if (local_line_left && !local_line_right) { // If left sensor sees line, turn slightly right
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(follow_speed_fast));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(follow_speed_slow));
+            } else if (local_line_right && !local_line_left) { // If right sensor sees line, turn slightly left
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(follow_speed_slow));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(follow_speed_fast));
+            } else { // If lost or seeing both, just drive straight slowly
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(follow_speed_slow));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(follow_speed_slow));
+            }
+            break;
+        }
+
+
+        case RETREAT:
+            // This is our "smart retreat". It reads sensor data directly
+            // to execute the most efficient retreat maneuver.
+            uint8_t local_line_left = 0, local_line_right = 0;
+            if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                local_line_left = line_left;
+                local_line_right = line_right;
+                xSemaphoreGive(sensorsMutex);
+            }
+            
+            bdc_motor_reverse(motor1);
+            bdc_motor_reverse(motor2);
+            if (is_seen_left_line) {
+                // bdc_motor_forward(motor1);
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(100));
+                // bdc_motor_brake(motor2);
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(65));
+            } else {
+                // bdc_motor_forward(motor1);
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(65));
+                // bdc_motor_brake(motor1);
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
+            }
+            // } else
+
+            // if (local_line_left && !local_line_right) { // Left sensor only: back up and turn RIGHT
+            //     bdc_motor_forward(motor2);
+            //     bdc_motor_set_speed(motor1, percent_to_duty_cycle(75));
+            //     bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
+            // } else if (local_line_right && !local_line_left) { // Right sensor only: back up and turn LEFT
+            //     bdc_motor_forward(motor1);
+            //     bdc_motor_set_speed(motor1, percent_to_duty_cycle(100));
+            //     bdc_motor_set_speed(motor2, percent_to_duty_cycle(75));
+            // } else { // Both sensors or error: back up straight
+            //     bdc_motor_forward(motor1);
+            //     bdc_motor_set_speed(motor1, percent_to_duty_cycle(75));
+            //     bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
+            // }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            break;
+
+        case IDLE:
+        default:
+            bdc_motor_brake(motor1);
+            bdc_motor_brake(motor2);
+            break;
+    }
+
+    #ifdef ACTIVE_DEBUG
+    // This log can be very spammy, use with caution.
+    // ESP_LOGI("motor_timer", "State: %d, Output: %d", local_state, local_output);
+    #endif
+}
+
+void imu_task(void *arg) {
+    uint32_t io_num;
+    uint8_t data[14];
+    int64_t last_time = esp_timer_get_time();
+    const float gyro_scale = 16.4; // For ±2000 dps range configured in init
+
+    while (1) {
+        if (xQueueReceive(imu_event_queue, &io_num, portMAX_DELAY)) {
+            if (mpu9250_register_read(MPU9250_ACCEL_XOUT_H, data, 14) == ESP_OK) {
+                
+                int64_t now = esp_timer_get_time();
+                float dt = (now - last_time) / 1000000.0f; // Seconds
+                last_time = now;
+
+                if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    // Raw Data
+                    g_imu_processed.acc_x = (int16_t)((data[0] << 8) | data[1]);
+                    g_imu_processed.acc_y = (int16_t)((data[2] << 8) | data[3]);
+                    g_imu_processed.acc_z = (int16_t)((data[4] << 8) | data[5]);
+                    
+                    // Gyro Z with Offset removal
+                    float gz_raw = (int16_t)((data[12] << 8) | data[13]) - g_imu_processed.gyro_z_offset;
+                    
+                    // Deadzone to kill drift when sitting still
+                    if (fabs(gz_raw) < 15.0f) gz_raw = 0;
+
+                    // Integrate Yaw (Heading)
+                    g_imu_processed.yaw += (gz_raw / gyro_scale) * dt;
+                    
+                    // Keep yaw in 0-360 range
+                    if (g_imu_processed.yaw >= 360.0f) g_imu_processed.yaw -= 360.0f;
+                    if (g_imu_processed.yaw < 0.0f) g_imu_processed.yaw += 360.0f;
+
+                    // Tilt Detection (Pitch estimate using Accel Z)
+                    // If Z gravity drops, we are tilted
+                    if (abs(g_imu_processed.acc_z) < (g_imu_processed.acc_z_nominal * 0.75f)) {
+                        g_imu_processed.is_tilted = true;
+                    } else {
+                        g_imu_processed.is_tilted = false;
+                    }
+
+                    xSemaphoreGive(sensorsMutex);
+                }
+
+                // Machine readable output for your Python Viz
+                printf("PY:%.1f,%d,%d,%d\n", g_imu_processed.yaw, g_imu_processed.acc_x, g_imu_processed.acc_y, g_imu_processed.acc_z);
+            }
+        }
+    }
+}
+
+// --========================= MAIN APPLICATION =========================--
+
+void app_main(void) {
+    // 1. Initialize Hardware
+    setup();
+    mpu9250_init();
+    imu_interrupt_setup();
+    servo_init();
+    servo_set_angle(90);
+    // seed the PRNG for strategies that use rand()
+    srand((unsigned) (esp_timer_get_time() & 0xFFFFFFFF));
+    gpio_set_level(ONBOARD_LED, 1); // Turn on LED to indicate setup is complete
+
+    // 2. Select Mode
+    // For testing, we can hardcode the mode. Uncomment mode_select() for button control.
+    // mode_select();
+    mode_select_count();
+    // mode = 1; // <--- CHANGE THIS VALUE TO TEST DIFFERENT MODES (1-4)
+    // blink_led(mode, 200); // Blink to confirm which mode is selected
+    gpio_set_level(ONBOARD_LED, 1); // Turn on LED to indicate setup is complete
+    wing_select_count();
+    // #ifdef ACTIVE_DEBUG
+    // ESP_LOGI(MAIN_TAG, "Mode %d selected", mode);
+    // #endif
+
+    // 3. Wait for Start Signal (if enabled)
+    #ifdef USE_START_STOP_MODULE
+    ESP_LOGI(MAIN_TAG, "Waiting for start signal on GPIO %d...", START_STOP_MODULE);
+    while (!gpio_get_level(START_STOP_MODULE)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    is_running = true;
+    ESP_LOGI(MAIN_TAG, "Start signal received! Go!");
+    #else
+    is_running = true; // If module is disabled, start immediately
+    #endif
+
+    if(wing_mode == 1) {
+        servo_set_angle(1);
+    }
+    else if (wing_mode == 2) {
+        servo_set_angle(170);
+
+    }
+    else servo_set_angle(85);
+
+    // 4. Assign Strategy based on Mode
+    switch (mode) {
+        case 1:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Hunter");
+            current_strategy = &strategy_hunter;
+            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+            break;
+        case 2:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Bulldozer");
+            current_strategy = &strategy_bulldozer;
+            initial_move_duration_ms = BULLDOZER_INITIAL_MOVE_DURATION_MS;
+            break;
+        case 4:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Matador (LEFT)");
+            current_strategy = &strategy_matador_left;
+            initial_move_duration_ms = MATADOR_INITIAL_MOVE_DURATION_MS;
+            break;
+        case 3:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Matador (RIGHT)");
+            current_strategy = &strategy_matador_right;
+            initial_move_duration_ms = MATADOR_INITIAL_MOVE_DURATION_MS;
+            break;
+        case 5:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Staggered Burst");
+            current_strategy = &strategy_staggered_burst;
+            initial_move_duration_ms = 0;
+            break;
+        case 6:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Calibration Aiming");
+            current_strategy = &strategy_calibration_turn;
+            initial_move_duration_ms = 0;
+            break;
+        case 7:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Dash Left");
+            current_strategy = &strategy_dash_left;
+            initial_move_duration_ms = 0; // handled by strategy itself
+            break;
+        case 8:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: Dash Right");
+            current_strategy = &strategy_dash_right;
+            initial_move_duration_ms = 0; // handled by strategy itself
+            break;
+        case 9:
+            ESP_LOGI(MAIN_TAG, "Strategy selected: The Viper");
+            current_strategy = &strategy_viper;
+            initial_move_duration_ms = 0;
+            break;
+        default:
+            ESP_LOGW(MAIN_TAG, "Invalid mode selected. Defaulting to Bulldozer.");
+            current_strategy = &strategy_bulldozer;
+            initial_move_duration_ms = BULLDOZER_INITIAL_MOVE_DURATION_MS;
+            break;
+    }
+
+    // 5. Initialize RTOS Components
+    sensorsMutex = xSemaphoreCreateMutex();
+    pidMutex = xSemaphoreCreateMutex();
+
+    // 6. Start the Brain and Muscle
+    xTaskCreate(run_strategy_task, "run_strategy_task", 4096, NULL, 5, NULL);
+    xTaskCreate(imu_task, "imu_task", 4096, NULL, 10, NULL);
+
+    esp_timer_create_args_t motor_timer_args = {
+        .callback = &motor_controller_callback,
+        .name = "motor_control_timer"
+    };
+    esp_timer_create(&motor_timer_args, &motorControlTimer);
+    esp_timer_start_periodic(motorControlTimer, MOTOR_CONTROL_TIMER_PERIOD * 1000);
+
+    ESP_LOGI(MAIN_TAG, "Application startup complete.");
+}
+
+
+/**
+ * @brief Handles mode selection via button presses.
+ *
+ * A short press increments the mode number. A long press selects the current mode
+ * and exits the function. The number of blinks indicates the current mode.
+ */
+static void mode_select() {
+    int press_time = 0;
+    mode = 0; // Initialize mode
+
+    ESP_LOGI(MAIN_TAG, "Entering mode selection. Short press to cycle, long press to confirm.");
+    gpio_set_level(ONBOARD_LED, 0); // Ensure LED is off initially
+
+    while (true) { // Loop indefinitely until a mode is selected
+        if (gpio_get_level(MODE_BUTTON) == 0) { // Button is pressed
+            press_time = 0;
+            // Wait for button release or long press threshold
+            while (gpio_get_level(MODE_BUTTON) == 0) {
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                press_time += 100;
+
+                if (press_time >= LONG_PRESS_THRESHOLD_MS) { // Long press detected
+                    ESP_LOGI(MAIN_TAG, "Long press detected. Final mode %d selected.", mode);
+                    gpio_set_level(ONBOARD_LED, 1); // Turn on LED to confirm selection
+                    return; // Exit function
+                }
+            }
+
+            // If we reach here, it was a short press (button released before long press threshold)
+            mode++;
+            if (mode > 14) mode = 1; // Cycle through available modes (1-14)
+            ESP_LOGI(MAIN_TAG, "Mode set to %d", mode);
+            blink_led(mode, 150); // Blink to indicate current mode
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Small delay to prevent busy-waiting
+    }
+}
+
+/**
+    * @brief Alternative mode selection: press the button N times consecutively
+    * within a short timeout to select mode N. After the sequence completes the
+    * LED will blink N times and stay on.
+    */
+static void mode_select_count() {
+    const int COUNT_TIMEOUT_MS = 1500; // timeout between presses
+    int press_count = 0;
+    int64_t last_press_time = 0;
+
+    ESP_LOGI(MAIN_TAG, "Entering count mode selection. Press button N times to select mode N.");
+    gpio_set_level(ONBOARD_LED, 0);
+
+    // Wait for first press
+    while (press_count == 0) {
+        if (gpio_get_level(MODE_BUTTON) == 0) {
+            // simple debounce and wait for release
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            while (gpio_get_level(MODE_BUTTON) == 0) vTaskDelay(10 / portTICK_PERIOD_MS);
+            press_count = 1;
+            last_press_time = esp_timer_get_time();
+            ESP_LOGI(MAIN_TAG, "Press count: %d", press_count);
+            break;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    // Count subsequent presses until timeout
+    while (1) {
+        if (gpio_get_level(MODE_BUTTON) == 0) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            while (gpio_get_level(MODE_BUTTON) == 0) vTaskDelay(10 / portTICK_PERIOD_MS);
+            press_count++;
+            last_press_time = esp_timer_get_time();
+            ESP_LOGI(MAIN_TAG, "Press count: %d", press_count);
+        } else {
+            int64_t elapsed = (esp_timer_get_time() - last_press_time) / 1000;
+            if (elapsed >= COUNT_TIMEOUT_MS) break;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    if (press_count < 1) press_count = 1;
+    if (press_count > 14) press_count = 14; // cap to available modes
+
+    mode = press_count;
+    ESP_LOGI(MAIN_TAG, "Final mode %d selected by counting", mode);
+    blink_led(mode, 150);
+    gpio_set_level(ONBOARD_LED, 1);
+}
+
+static void wing_select_count() {
+    const int COUNT_TIMEOUT_MS = 1500; // timeout between presses
+    int press_count = 0;
+    int64_t last_press_time = 0;
+
+    ESP_LOGI(MAIN_TAG, "Entering count mode selection. Press button N times to select mode N.");
+    gpio_set_level(ONBOARD_LED, 0);
+
+    // Wait for first press
+    while (press_count == 0) {
+        if (gpio_get_level(MODE_BUTTON) == 0) {
+            // simple debounce and wait for release
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            while (gpio_get_level(MODE_BUTTON) == 0) vTaskDelay(10 / portTICK_PERIOD_MS);
+            press_count = 1;
+            last_press_time = esp_timer_get_time();
+            ESP_LOGI(MAIN_TAG, "Press count: %d", press_count);
+            break;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    // Count subsequent presses until timeout
+    while (1) {
+        if (gpio_get_level(MODE_BUTTON) == 0) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            while (gpio_get_level(MODE_BUTTON) == 0) vTaskDelay(10 / portTICK_PERIOD_MS);
+            press_count++;
+            last_press_time = esp_timer_get_time();
+            ESP_LOGI(MAIN_TAG, "Press count: %d", press_count);
+        } else {
+            int64_t elapsed = (esp_timer_get_time() - last_press_time) / 1000;
+            if (elapsed >= COUNT_TIMEOUT_MS) break;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    if (press_count < 1) press_count = 1;
+    if (press_count > 14) press_count = 14; // cap to available modes
+
+    wing_mode = press_count;
+    ESP_LOGI(MAIN_TAG, "Final mode %d selected by counting", mode);
+    blink_led(mode, 150);
+    gpio_set_level(ONBOARD_LED, 1);
+}
