@@ -24,11 +24,15 @@ typedef struct {
     float pitch;        
     bool is_tilted;     
     float gyro_z_offset;
+    float acc_x_offset;
+    float acc_y_offset;
     float acc_z_nominal;
     float impact_magnitude;
     bool impact_detected;
     bool impact_side_left;
     bool impact_side_right;
+    bool robot_flipped;
+    bool robot_stalled;
 } imu_data_t;
 
 #endif // ROBOT_TYPES_H

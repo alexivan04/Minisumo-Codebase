@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MiniSumo Real-Time Telemetry</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #eee; margin: 20px; }
+        .dashboard { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
+        .card { background: #2d2d2d; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .stat-item { border-left: 4px solid #444; padding-left: 10px; margin-bottom: 10px; }
+        .stat-label { font-size: 0.8em; color: #888; text-transform: uppercase; }
+        .stat-value { font-size: 1.4em; font-weight: bold; }
+        .impact-warn { color: #ff4444; animation: blink 0.5s infinite; }
+        @keyframes blink { 50% { opacity: 0; } }
+        .sensor-bits { font-family: monospace; letter-spacing: 5px; font-size: 1.2em; color: #00ff00; }
+        .chart-container { height: 300px; margin-bottom: 20px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>MiniSumo Real-Time Telemetry</h1>
+    
+    <div class="dashboard">
+        <div class="left-col">
+            <div class="card">
+                <h2>Robot Status</h2>
+                <div class="stat-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Time</div>
+                        <div id="val-ts" class="stat-value">0.00s</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Mode / Wing</div>
+                        <div id="val-mode" class="stat-value">M0 W0</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">State</div>
+                        <div id="val-state" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Power</div>
+                        <div id="val-pwr" class="stat-value">0%</div>
+                    </div>
+                </div>
+                <h3>Sensors</h3>
+                <div class="stat-item">
+                    <div class="stat-label">ToF (C,R90,R,L90,L)</div>
+                    <div id="val-sensors" class="sensor-bits">00000</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Lines (R, L)</div>
+                    <div id="val-lines" class="sensor-bits">00</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Impact</div>
+                    <div id="val-impact" class="stat-value">SAFE</div>
+                </div>
+                <div style="margin-top: 20px;">
+                    <button onclick="saveLog()">Save Current Session</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="right-col">
+            <div class="card">
+                <div class="chart-container">
+                    <canvas id="pwrChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="imuChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Use auto-discovery for socket.io with verbose debugging
+        const socket = io({
+            reconnectionAttempts: 10,
+            timeout: 10000,
+            transports: ['polling', 'websocket'] // Allow fallback for better stability
+        });
+        
+        console.log("Script initialized, waiting for connection...");
+
+        const pwrCtx = document.getElementById('pwrChart').getContext('2d');
+        const imuCtx = document.getElementById('imuChart').getContext('2d');
+
+        const chartConfig = {
+            type: 'line',
+            data: { labels: [], datasets: [] },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false,
+                animation: false,
+                scales: { 
+                    x: { display: false }, 
+                    y: { 
+                        grid: { color: '#444' },
+                        ticks: { color: '#888' }
+                    } 
+                },
+                plugins: { 
+                    legend: { labels: { color: '#eee' } } 
+                }
+            }
+        };
+
+        const pwrChart = new Chart(pwrCtx, JSON.parse(JSON.stringify(chartConfig)));
+        pwrChart.data.datasets = [{
+            label: 'Power %',
+            borderColor: '#007bff',
+            backgroundColor: 'rgba(0, 123, 255, 0.1)',
+            fill: true,
+            data: [],
+            borderWidth: 2,
+            pointRadius: 0
+        }];
+
+        const imuChart = new Chart(imuCtx, JSON.parse(JSON.stringify(chartConfig)));
+        imuChart.data.datasets = [
+            { label: 'Yaw', borderColor: '#28a745', data: [], borderWidth: 2, pointRadius: 0 },
+            { label: 'Accel X (G)', borderColor: '#dc3545', data: [], borderWidth: 2, pointRadius: 0 }
+        ];
+
+        socket.on('connect', () => {
+            console.log('CONNECTED TO SERVER');
+            document.title = "LIVE - MiniSumo";
+        });
+
+        socket.on('disconnect', () => {
+            console.warn('DISCONNECTED FROM SERVER');
+            document.title = "OFFLINE - MiniSumo";
+        });
+
+        socket.on('telemetry_reset', () => {
+            console.log("RESET SIGNAL RECEIVED");
+            pwrChart.data.labels = [];
+            pwrChart.data.datasets[0].data = [];
+            imuChart.data.labels = [];
+            imuChart.data.datasets.forEach(ds => ds.data = []);
+            pwrChart.update();
+            imuChart.update();
+        });
+
+        socket.on('telemetry_update', (data) => {
+            // Update Text UI
+            document.getElementById('val-ts').innerText = data.ts.toFixed(2) + 's';
+            document.getElementById('val-mode').innerText = `M${data.mode} W${data.wing}`;
+            document.getElementById('val-state').innerText = data.state;
+            document.getElementById('val-pwr').innerText = data.pwr + '%';
+            document.getElementById('val-sensors').innerText = data.sensors;
+            document.getElementById('val-lines').innerText = data.lines;
+            document.getElementById('val-impact').innerText = data.impact;
+            
+            // LOG DATA FOR USER AS REQUESTED
+            if (data.ts > 0) {
+                console.log(`[${data.ts}s] P:${data.pwr} Y:${data.yaw} A:${data.ax} I:${data.impact}`);
+            }
+
+            const impactEl = document.getElementById('val-impact');
+            if(data.impact !== 'SAFE') {
+                impactEl.classList.add('impact-warn');
+                impactEl.style.color = '#ff4444';
+            } else {
+                impactEl.classList.remove('impact-warn');
+                impactEl.style.color = '#eee';
+            }
+
+            // Detect Reset (T=0)
+            if (data.ts < 0.1 && pwrChart.data.labels.length > 50) {
+                console.log("Robot reset detected. Clearing charts.");
+                pwrChart.data.labels = [];
+                pwrChart.data.datasets[0].data = [];
+                imuChart.data.labels = [];
+                imuChart.data.datasets.forEach(ds => ds.data = []);
+            }
+
+            // Update Charts
+            [pwrChart, imuChart].forEach(chart => {
+                chart.data.labels.push(data.ts);
+                if(chart.data.labels.length > 300) { // Show ~12 seconds of data at 25Hz
+                    chart.data.labels.shift();
+                    chart.data.datasets.forEach(ds => ds.data.shift());
+                }
+            });
+
+            pwrChart.data.datasets[0].data.push(data.pwr);
+            imuChart.data.datasets[0].data.push(data.yaw);
+            imuChart.data.datasets[1].data.push(data.ax); 
+
+            pwrChart.update('none'); // Update without animation for performance
+            imuChart.update('none');
+        });
+
+        function saveLog() {
+            fetch('/save_log', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    alert('Session saved successfully!\nFilename: ' + d.filename);
+                })
+                .catch(err => alert('Save failed: ' + err));
+        }
+    </script>
+</body>
+</html>

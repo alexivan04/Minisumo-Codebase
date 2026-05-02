@@ -20,6 +20,14 @@
 #include "main_config.h"
 #include "robot_types.h"
 #include "strategies.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+
+#define WIFI_SSID      "MiniSumo_Telemetry"
+#define WIFI_PASS      "robot123"
+#define UDP_PORT       3333
 
 // --- Global Variables ---
 bdc_motor_handle_t motor1 = NULL, motor2 = NULL;
@@ -59,6 +67,110 @@ SemaphoreHandle_t pidMutex;
 
 volatile imu_data_t g_imu_processed; 
 QueueHandle_t imu_event_queue;
+
+// --==================== TELEMETRY =====================--
+
+static void wifi_init_softap(void) {
+    ESP_LOGI(TAG, "Initializing WiFi SoftAP...");
+    ESP_ERROR_CHECK(esp_netif_init());
+    // Only create default loop if not already created
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = 1,
+            .password = WIFI_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi AP Started. SSID:%s Password:%s", WIFI_SSID, WIFI_PASS);
+}
+
+void telemetry_task(void *pvParameters) {
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr("192.168.4.255"); // Broadcast
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(UDP_PORT);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int broadcast_en = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_en, sizeof(broadcast_en));
+
+    // Increase task priority so it doesn't get starved
+    vTaskPrioritySet(NULL, 6); 
+
+    char payload[256];
+    uint32_t start_signal_ms = 0;
+    bool timer_latched = false;
+
+    while (1) {
+        // Latch the time when we first receive the start signal
+        if (is_running && !timer_latched) {
+            start_signal_ms = esp_log_timestamp();
+            timer_latched = true;
+        } else if (!is_running) {
+            timer_latched = false; // Reset if robot is stopped
+        }
+
+        uint32_t current_ms = esp_log_timestamp();
+        uint32_t relative_ts = timer_latched ? (current_ms - start_signal_ms) : 0;
+
+        // Human-friendly terminal-style formatting with timestamp relative to START SIGNAL
+        // Digital Sensors: S:10101 (Center, R90, R, L90, L) - 1 if object SEEN
+        // Line Sensors: L:RL (Right, Left) - 1 if whitespace SEEN
+        snprintf(payload, sizeof(payload), 
+            "[%7.2f s] [M:%d W:%d] [S:%d%d%d%d%d L:%d%d] [State:%d] Pwr:%4d | Yaw:%6.1f | Ax:%5.1fG | Impact:%s\n", 
+            (float)relative_ts / 1000.0f,
+            mode,
+            wing_mode,
+            dist_center, 
+            dist_r90, 
+            dist_r,
+            dist_l90,
+            dist_l,
+            line_right, line_left,
+            state_PID, 
+            output_PID,
+            g_imu_processed.yaw, 
+            (float)(g_imu_processed.acc_x - g_imu_processed.acc_x_offset) / 2048.0f,
+            g_imu_processed.impact_detected ? "!!HIT!!" : (g_imu_processed.impact_side_left ? "SIDE-L" : (g_imu_processed.impact_side_right ? "SIDE-R" : "SAFE")));
+        
+        int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0) {
+            ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(20)); // ~25Hz
+    }
+}
 
 // --==================== UTILITY FUNCTIONS =====================--
 
@@ -115,26 +227,35 @@ void mpu9250_init() {
     gpio_set_level(ONBOARD_LED, 1);
     
     float gyro_sum = 0;
+    float accel_x_sum = 0;
+    float accel_y_sum = 0;
     float accel_z_sum = 0;
     int samples = 500;
     uint8_t data[14];
     
     for (int i = 0; i < samples; i++) {
         if (mpu9250_register_read(MPU9250_ACCEL_XOUT_H, data, 14) == ESP_OK) {
-            int16_t gz = (int16_t)((data[12] << 8) | data[13]);
+            int16_t ax = (int16_t)((data[0] << 8) | data[1]);
+            int16_t ay = (int16_t)((data[2] << 8) | data[3]);
             int16_t az = (int16_t)((data[4] << 8) | data[5]);
-            gyro_sum += gz;
+            int16_t gz = (int16_t)((data[12] << 8) | data[13]);
+            accel_x_sum += ax;
+            accel_y_sum += ay;
             accel_z_sum += az;
+            gyro_sum += gz;
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     
-    g_imu_processed.gyro_z_offset = gyro_sum / (float)samples;
+    g_imu_processed.acc_x_offset = accel_x_sum / (float)samples;
+    g_imu_processed.acc_y_offset = accel_y_sum / (float)samples;
     g_imu_processed.acc_z_nominal = accel_z_sum / (float)samples;
+    g_imu_processed.gyro_z_offset = gyro_sum / (float)samples;
     g_imu_processed.yaw = 0.0f;
     
-    ESP_LOGI(TAG, "Calibration Done! Gyro Offset: %.2f, AccZ Nominal: %.2f", 
-             g_imu_processed.gyro_z_offset, g_imu_processed.acc_z_nominal);
+    ESP_LOGI(TAG, "Calibration Done! Gyro Offset: %.2f, AccZ Nominal: %.2f, AccXY Offsets: %.1f,%.1f", 
+             g_imu_processed.gyro_z_offset, g_imu_processed.acc_z_nominal,
+             g_imu_processed.acc_x_offset, g_imu_processed.acc_y_offset);
     
     gpio_set_level(ONBOARD_LED, 0);
 }
@@ -271,6 +392,7 @@ void read_sensors() {
     uint8_t line_left_local = gpio_get_level(LINE_LEFT);
 #endif
 
+    // RAW SENSOR WRITE: No buffering or confirmation logic needed per user request
     if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         dist_center = dist_center_local;
         dist_r90 = dist_r90_local;
@@ -459,6 +581,26 @@ void run_strategy_task(void *arg) {
                     initial_move_done = true;
                 }
             }
+
+            // --- Stall Supervisor (Flip detection disabled) ---
+            if (is_running) {
+                // Stall Detection: If at high power and not moving for too long
+                // This now runs even if in timed_retreat or specialized modes to ensure robot never stays stuck
+                static int64_t last_movement_time = 0;
+                if (!g_imu_processed.robot_stalled) {
+                    last_movement_time = esp_timer_get_time();
+                } else if (abs(output_PID) >= 80) { // Only check stall if we are actually trying to move fast
+                    int64_t stall_duration = (esp_timer_get_time() - last_movement_time) / 1000;
+                    if (stall_duration >= STALL_POTENTIAL_MS) {
+                        ESP_LOGW("Supervisor", "STALL DETECTED! Executing wiggle...");
+                        // Trigger a small wiggle or retreat to unstuck
+                        state_PID = FOUND;
+                        output_PID = (output_PID > 0) ? -70 : 70; // Reverse the intended direction
+                        // We reset the timer slightly so we don't spam wiggle
+                        last_movement_time = esp_timer_get_time() - (500 * 1000); 
+                    }
+                }
+            }
         } else {
             state_PID = IDLE;
             output_PID = 0;
@@ -489,8 +631,14 @@ void imu_task(void *arg) {
                 int16_t ay = (int16_t)((data[2] << 8) | data[3]);
                 int16_t az = (int16_t)((data[4] << 8) | data[5]);
                 
-                // Calculate impact magnitude (simple vector length on XY or just X if mostly forward)
-                float impact = sqrtf((float)ax*ax + (float)ay*ay);
+                // Accelerometer raw to G (assuming +/- 16G range set during init)
+                // 16G range = 2048 LSB/g
+                float ax_g = (float)(ax - g_imu_processed.acc_x_offset) / 2048.0f;
+                float ay_g = (float)(ay - g_imu_processed.acc_y_offset) / 2048.0f;
+                float az_g = (float)az / 2048.0f;
+
+                // Calculate impact magnitude (simple vector length on XY)
+                float impact = sqrtf(ax_g*ax_g + ay_g*ay_g);
 
                 if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     g_imu_processed.acc_x = ax;
@@ -498,14 +646,14 @@ void imu_task(void *arg) {
                     g_imu_processed.acc_z = az;
                     
                     g_imu_processed.impact_magnitude = impact;
-                    if (impact > IMPACT_THRESHOLD && (now - last_impact_time) > IMPACT_COOLDOWN_MS * 1000) {
+                    if (impact > IMPACT_THRESHOLD_G && (now - last_impact_time) > IMPACT_COOLDOWN_MS * 1000) {
                         g_imu_processed.impact_detected = true;
                         
-                        // Determine side based on Acc Y
-                        if (ay > LATERAL_IMPACT_THRESHOLD) {
+                        // Determine side based on Acc Y (Lateral direction)
+                        if (ay_g > 1.0f) { // Significant lateral G
                             g_imu_processed.impact_side_left = true;
                             g_imu_processed.impact_side_right = false;
-                        } else if (ay < -LATERAL_IMPACT_THRESHOLD) {
+                        } else if (ay_g < -1.0f) {
                             g_imu_processed.impact_side_left = false;
                             g_imu_processed.impact_side_right = true;
                         } else {
@@ -520,13 +668,47 @@ void imu_task(void *arg) {
                         g_imu_processed.impact_side_right = false;
                     }
 
+                    // Flip Detection (Using Z acceleration)
+                    // If Z-axis is reversed or significantly weak while robot is supposedly on ground
+                    // Note: Z axis is UP, so nominal is ~ +1.0G (2048 LSB)
+                    // We check if Z is less than -0.5G (strongly pointing down) to confirm flip
+                    if (az_g < FLIP_THRESHOLD_Z) {
+                        g_imu_processed.robot_flipped = true;
+                    } else {
+                        g_imu_processed.robot_flipped = false;
+                    }
+
+                    // Stall Detection
+                    // If we are at high power (calculated in state machine) but X accel is near zero
+                    // This is better checked in the strategy/supervisor level where 'output' is known.
+                    // For now, we update the raw state.
+                    if (fabsf(ax_g) < STALL_THRESHOLD_ACCEL && fabsf(ay_g) < STALL_THRESHOLD_ACCEL) {
+                         // Potential stall - let strategy verify with motor power
+                         g_imu_processed.robot_stalled = true; 
+                    } else {
+                         g_imu_processed.robot_stalled = false;
+                    }
+
+                    // TESTING: Log when stall or flip is detected (throttled)
+                    static int log_div = 0;
+                    if (++log_div >= 50) {
+                        if (g_imu_processed.robot_stalled || g_imu_processed.robot_flipped) {
+                            ESP_LOGI("IMU_TEST", "Status: %s %s | Z_G: %.2f | X_G: %.2f", 
+                                g_imu_processed.robot_stalled ? "[STALL]" : "",
+                                g_imu_processed.robot_flipped ? "[FLIP]" : "",
+                                az_g, ax_g);
+                        }
+                        log_div = 0;
+                    }
+
                     float gz_raw = (int16_t)((data[12] << 8) | data[13]) - g_imu_processed.gyro_z_offset;
-                    if (fabs(gz_raw) < 15.0f) gz_raw = 0;
+                    if (fabsf(gz_raw) < 15.0f) gz_raw = 0;
                     g_imu_processed.yaw += (gz_raw / gyro_scale) * dt;
                     if (g_imu_processed.yaw >= 360.0f) g_imu_processed.yaw -= 360.0f;
                     if (g_imu_processed.yaw < 0.0f) g_imu_processed.yaw += 360.0f;
                     
-                    if (abs(g_imu_processed.acc_z) < (g_imu_processed.acc_z_nominal * 0.75f)) {
+                    // Tilt detection: If gravity on Z is weak, robot is tilted
+                    if (az_g < 0.5f) {
                         g_imu_processed.is_tilted = true;
                     } else {
                         g_imu_processed.is_tilted = false;
@@ -622,6 +804,16 @@ static void wing_select_count() {
 // --========================= MAIN APPLICATION =========================--
 
 void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    wifi_init_softap();
+    xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);
+
     setup();
     servo_init();
     servo_set_angle(90);

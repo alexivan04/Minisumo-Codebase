@@ -130,7 +130,7 @@
 #define ENEMY_CONFIRMATION_THRESHOLD 7
 
 #define MOTOR_CONTROL_TIMER_PERIOD  15      
-#define SENSOR_READING_DELAY        10      
+#define SENSOR_READING_DELAY_VAL    10      
 #define LONG_PRESS_DELAY            1000    
 #define DOUBLE_PRESS_DELAY          3000    
 #define CALIBRATION_AIM_MS         800
@@ -142,5 +142,16 @@
 static const float Kp = 40.0;                  
 static const int MIN_TURN_SPEED = 35;          
 static const int MAX_TURN_SPEED = 80;          
+
+// IMU Logic Thresholds
+#define IMPACT_THRESHOLD_G          3.5f    // High G shock for impact
+#define PUSHING_ACCEL_THRESHOLD_VAL    0.15f   // Low horizontal steady movement while pushing
+#define FLIP_THRESHOLD_Z            -1.2f   // DISABLED: Threshold set to impossible value to prevent "stutter"
+#define STALL_THRESHOLD_ACCEL       0.05f   // Almost zero movement
+#define STALL_POTENTIAL_MS          1500    // Time at full power with low accel before "Stalled"
+
+#include "robot_types.h"
+extern volatile imu_data_t g_imu_processed;
+extern SemaphoreHandle_t sensorsMutex;
 
 #endif // MAIN_CONFIG_H

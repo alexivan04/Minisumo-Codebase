@@ -49,9 +49,8 @@ void strategy_hunter(void) {
         );
 
         if (is_enemy_present) {
-            if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
-                enemy_seen_counter++;
-            }
+            // Instant reaction - no confirmation threshold
+            enemy_seen_counter = ENEMY_CONFIRMATION_THRESHOLD;
         } else {
             enemy_seen_counter = 0;
         }
