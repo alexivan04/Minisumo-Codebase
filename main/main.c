@@ -109,6 +109,34 @@ void mpu9250_init() {
     mpu9250_register_write(0x1B, 0x18); 
     mpu9250_register_write(0x1C, 0x18);
     mpu9250_register_write(MPU9250_INT_ENABLE, 0x01);
+
+    // Calibration logic
+    ESP_LOGI(TAG, "Starting IMU Calibration (Keep robot still)...");
+    gpio_set_level(ONBOARD_LED, 1);
+    
+    float gyro_sum = 0;
+    float accel_z_sum = 0;
+    int samples = 500;
+    uint8_t data[14];
+    
+    for (int i = 0; i < samples; i++) {
+        if (mpu9250_register_read(MPU9250_ACCEL_XOUT_H, data, 14) == ESP_OK) {
+            int16_t gz = (int16_t)((data[12] << 8) | data[13]);
+            int16_t az = (int16_t)((data[4] << 8) | data[5]);
+            gyro_sum += gz;
+            accel_z_sum += az;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    
+    g_imu_processed.gyro_z_offset = gyro_sum / (float)samples;
+    g_imu_processed.acc_z_nominal = accel_z_sum / (float)samples;
+    g_imu_processed.yaw = 0.0f;
+    
+    ESP_LOGI(TAG, "Calibration Done! Gyro Offset: %.2f, AccZ Nominal: %.2f", 
+             g_imu_processed.gyro_z_offset, g_imu_processed.acc_z_nominal);
+    
+    gpio_set_level(ONBOARD_LED, 0);
 }
 
 static void IRAM_ATTR imu_gpio_isr_handler(void* arg) {
@@ -562,11 +590,25 @@ static void wing_select_count() {
 
 void app_main(void) {
     setup();
-    mpu9250_init();
-    imu_interrupt_setup();
     servo_init();
     servo_set_angle(90);
     srand((unsigned) (esp_timer_get_time() & 0xFFFFFFFF));
+    
+    // Turn off LED and wait for button press to start IMU init/calibration
+    gpio_set_level(ONBOARD_LED, 0);
+    ESP_LOGI(TAG, "Press MODE button once to start IMU calibration...");
+    
+    while (gpio_get_level(MODE_BUTTON) != 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    // Debounce
+    vTaskDelay(pdMS_TO_TICKS(200));
+    while (gpio_get_level(MODE_BUTTON) == 0) vTaskDelay(pdMS_TO_TICKS(10));
+    
+    vTaskDelay(pdMS_TO_TICKS(1000)); // 1 second before starting init
+    mpu9250_init(); // This now handles LED and calibration details
+    
+    imu_interrupt_setup();
     gpio_set_level(ONBOARD_LED, 1);
 
     mode_select_count();
