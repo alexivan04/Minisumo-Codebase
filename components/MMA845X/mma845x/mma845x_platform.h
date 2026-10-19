@@ -47,8 +47,6 @@
 #ifndef __MMA845X_PLATFORM_H__
 #define __MMA845X_PLATFORM_H__
 
-#define ESP_PLATFORM  // ESP32 (ESP-IDF)
-#ifdef ESP_PLATFORM  // ESP32 (ESP-IDF)
 
 // platform specific includes
 #include "esp8266_wrapper.h"
@@ -56,4 +54,4 @@
 
 #endif // ESP_PLATFORM
 
-#endif // __MMA845X_PLATFORM_H__
+// __MMA845X_PLATFORM_H__

@@ -1,95 +1,112 @@
-import re
-import matplotlib.pyplot as plt
+import json
 import sys
+from pathlib import Path
 
-def parse_telemetry(file_path):
-    timestamps = []
-    powers = []
-    yaws = []
-    accels = []
-    impacts = []
-    states = []
-    
-    # Pattern to match: [   1.24 s] [M:0 W:0] [S:10000 L:00] [State:2] Pwr: 100 | Yaw:  90.2 | Ax: 0.1G | Impact:SAFE
-    pattern = re.compile(r"\[\s*(?P<ts>[\d\.]+)\s*s\].*?\[S:(?P<s_bits>[01]{5})\s+L:(?P<lr>\d)(?P<ll>\d)\].*?Pwr:\s*(?P<pwr>-?\d+).*?Yaw:\s*(?P<yaw>[\d\.-]+).*?Ax:\s*(?P<ax>[\d\.-]+)G")
-    
-    with open(file_path, 'r') as f:
-        for line in f:
-            match = pattern.search(line)
-            if match:
-                timestamps.append(float(match.group('ts')))
-                powers.append(int(match.group('pwr')))
-                yaws.append(float(match.group('yaw')))
-                accels.append(float(match.group('ax')))
-                
-                # Digital Sensors: S:10000 -> 1 if center seen
-                s_bits = match.group('s_bits')
-                dists.append(1.0 if s_bits[0] == '1' else 0.0) # We'll plot if Center sees something
-                
-                # Line sensor triggers
-                line_hits.append(1.0 if (int(match.group('lr')) or int(match.group('ll'))) else 0.0)
-                
-                # Check for hits in the raw line text
-                impacts.append(1.0 if "!!HIT!!" in line else 0.0)
 
-    return timestamps, powers, yaws, accels, impacts, dists, line_hits
+def load_telemetry(path):
+    with open(path, "r", encoding="utf-8") as file:
+        entries = json.load(file)
 
-def plot_data(ts, pwr, yaw, ax, hits, center_seen, line_hits):
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
-    
-    # Subplot 1: Power, Impacts, and Line Triggers
-    ax1.plot(ts, pwr, label='Motor Power (%)', color='blue', alpha=0.7)
-    ax1.fill_between(ts, 0, [h*100 for h in hits], color='red', alpha=0.3, label='Physical Impact')
-    ax1.fill_between(ts, -100, [lh*-100 for lh in line_hits], color='orange', alpha=0.3, label='Line Detected')
-    ax1.set_ylabel('Power / Events')
-    ax1.set_title('Robot Performance Analysis')
-    ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.3)
+    if not isinstance(entries, list):
+        raise ValueError("Logul trebuie sa contina o lista JSON.")
 
-    # Subplot 2: Digital Object Detection (Center)
-    ax2.step(ts, center_seen, label='Center Sensor (Sees Object)', color='brown', where='post')
-    ax2.set_ylabel('Object Detected')
-    ax2.set_ylim(-0.1, 1.1)
-    ax2.set_yticks([0, 1])
-    ax2.set_yticklabels(['OFF', 'ON'])
-    ax2.legend(loc='upper right')
-    ax2.grid(True, alpha=0.3)
+    required = {"ts", "sensors", "lines", "state", "pwr", "yaw", "ax", "impact"}
+    valid_entries = [entry for entry in entries if required.issubset(entry)]
+    if not valid_entries:
+        raise ValueError("Logul nu contine mesaje de telemetrie valide.")
+    return valid_entries
 
-    # Subplot 3: Yaw (Orientation)
-    ax3.plot(ts, yaw, label='Yaw (Degrees)', color='green')
-    ax3.set_ylabel('Yaw')
-    ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.3)
 
-    # Subplot 4: Forward Acceleration (G)
-    ax4.plot(ts, ax, label='Forward Accel (G)', color='purple')
-    ax4.set_ylabel('Accel (G)')
-    ax4.set_xlabel('Time (seconds)')
-    ax4.legend(loc='upper right')
-    ax4.grid(True, alpha=0.3)
+def summarize(entries):
+    power = [entry["pwr"] for entry in entries]
+    impacts = [entry for entry in entries if "!!HIT!!" in entry["impact"]]
+    line_events = [entry for entry in entries if entry["lines"] != "00"]
+    sensor_events = [entry for entry in entries if entry["sensors"] != "00000"]
 
-    plt.tight_layout()
+    print(f"Mesaje: {len(entries)}")
+    print(f"Durata: {entries[-1]['ts'] - entries[0]['ts']:.2f} s")
+    print(f"Putere medie: {sum(power) / len(power):.1f}%")
+    print(f"Putere maxima: {max(power)}%")
+    print(f"Detectari adversar: {len(sensor_events)}")
+    print(f"Evenimente linie: {len(line_events)}")
+    print(f"Impacturi: {len(impacts)}")
+
+
+def plot(entries):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as error:
+        raise RuntimeError(
+            "Pentru grafice instaleaza matplotlib: python -m pip install matplotlib"
+        ) from error
+
+    ts = [entry["ts"] for entry in entries]
+    power = [entry["pwr"] for entry in entries]
+    yaw = [entry["yaw"] for entry in entries]
+    accel = [entry["ax"] for entry in entries]
+    sensor_names = ["Center", "Right 90", "Right", "Left 90", "Left"]
+    sensors = [
+        [1 if entry["sensors"][index] == "1" else 0 for entry in entries]
+        for index in range(5)
+    ]
+    line = [1 if entry["lines"] != "00" else 0 for entry in entries]
+
+    figure, axes = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
+    axes[0].plot(ts, power, label="Power (%)", color="tab:blue")
+    axes[0].set_ylabel("Power (%)")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    colors = ["tab:brown", "tab:orange", "tab:red", "tab:purple", "tab:green"]
+    for values, name, color in zip(sensors, sensor_names, colors):
+        axes[1].step(ts, values, where="post", label=name, color=color)
+    axes[1].set_ylabel("Sensors")
+    axes[1].set_ylim(-0.1, 1.1)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    axes[2].plot(ts, yaw, label="Yaw (degrees)", color="tab:blue")
+    axes[2].set_ylabel("Yaw")
+    axes[2].grid(alpha=0.3)
+    axes[2].legend()
+
+    axes[3].plot(ts, accel, label="Accel X (G)", color="tab:purple")
+    axes[3].fill_between(
+        ts, 0, [-value for value in line], alpha=0.2,
+        color="tab:orange", label="Line sensor"
+    )
+    axes[3].set_xlabel("Time (s)")
+    axes[3].set_ylabel("Accel")
+    axes[3].grid(alpha=0.3)
+    axes[3].legend()
+
+    axes[4].step(ts, line, where="post", label="Line sensor", color="tab:orange")
+    axes[4].set_xlabel("Time (s)")
+    axes[4].set_ylabel("Line")
+    axes[4].set_ylim(-0.1, 1.1)
+    axes[4].grid(alpha=0.3)
+    axes[4].legend()
+
+    figure.suptitle("MiniSumo telemetry")
+    figure.tight_layout()
     plt.show()
 
-if __name__ == "__main__":
-    log_file = "robot_telemetry.log"
-    if len(sys.argv) > 1:
-        log_file = sys.argv[1]
-        
+
+def main():
+    if len(sys.argv) < 2:
+        print("Utilizare: python analyze_telemetry.py saved_logs\\log_....json [--plot]")
+        return 2
+
     try:
-        # Pre-initialize dists and line_hits to avoid unpack errors
-        timestamps = []
-        powers = []
-        yaws = []
-        accels = []
-        impacts = []
-        dists = []
-        line_hits = []
-        
-        data = parse_telemetry(log_file)
-        if not data[0]:
-            print(f"No valid data found in {log_file}. Check your format!")
-        else:
-            plot_data(*data)
-    except FileNotFoundError:
-        print(f"Error: {log_file} not found. Run 'socat' first to generate logs.")
+        entries = load_telemetry(Path(sys.argv[1]))
+        summarize(entries)
+        if "--plot" in sys.argv[2:]:
+            plot(entries)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"Eroare: {error}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

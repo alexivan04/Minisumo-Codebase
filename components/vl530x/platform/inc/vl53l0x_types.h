@@ -39,38 +39,38 @@
  */
 
 
-typedef unsigned long long uint64_t;
+// typedef unsigned long long uint64_t;
 
 
-/** @brief Typedef defining 32 bit unsigned int type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef unsigned int uint32_t;
+// /** @brief Typedef defining 32 bit unsigned int type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef unsigned int uint32_t;
 
-/** @brief Typedef defining 32 bit int type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef int int32_t;
+// /** @brief Typedef defining 32 bit int type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef int int32_t;
 
-/** @brief Typedef defining 16 bit unsigned short type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef unsigned short uint16_t;
+// /** @brief Typedef defining 16 bit unsigned short type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef unsigned short uint16_t;
 
-/** @brief Typedef defining 16 bit short type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef short int16_t;
+// /** @brief Typedef defining 16 bit short type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef short int16_t;
 
-/** @brief Typedef defining 8 bit unsigned char type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef unsigned char uint8_t;
+// /** @brief Typedef defining 8 bit unsigned char type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef unsigned char uint8_t;
 
-/** @brief Typedef defining 8 bit char type.\n
- * The developer should modify this to suit the platform being deployed.
- */
-typedef signed char int8_t;
+// /** @brief Typedef defining 8 bit char type.\n
+//  * The developer should modify this to suit the platform being deployed.
+//  */
+// typedef signed char int8_t;
 
 /** @}  */
 #endif /* _STDINT_H */
