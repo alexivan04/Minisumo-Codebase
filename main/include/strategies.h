@@ -60,6 +60,10 @@ void strategy_prescan_aim(void);
 void strategy_staggered_burst(void);
 void strategy_viper(void);
 
+void strategy_test_straight(void);
+void strategy_test_turn(void);
+void strategy_test_forward_180(void); // <--- ADD THIS LINE
+
 // Precision Movement
 void turn_degrees(float target_relative_degrees, int speed);
 

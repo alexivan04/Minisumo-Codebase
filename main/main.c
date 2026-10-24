@@ -25,6 +25,9 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 
+#include "esp_ota_ops.h"
+#include "esp_http_server.h"
+
 #define WIFI_SSID      "MiniSumo_Telemetry"
 #define WIFI_PASS      "robot123"
 #define UDP_PORT       3333
@@ -38,11 +41,16 @@ int enemy_seen_counter = 0;
 int64_t initial_move_start_time = 0;
 int initial_move_duration_ms = 0;
 bool is_in_timed_retreat = false;
+bool is_evading_stall = false;
+int64_t evade_start_time = 0;
+const int EVADE_DURATION_MS = 600; // 600ms evade maneuver
 int64_t retreat_start_time = 0;
 int64_t retreat_ignore_time = 0;
 int64_t last_enemy_seen_time = 0;
 bool is_seen_right_line = false;
 bool is_seen_left_line = false;
+float retreat_entry_yaw = 0.0f;
+
 
 state_t state = PATROL;
 int output = 0; 
@@ -58,7 +66,10 @@ uint8_t line_right, line_left;
 int mode = 0;
 int wing_mode = 0;
 bool is_running = false; 
-bool initial_move_done = false; 
+bool initial_move_done = false;
+
+float pid_kps = 2.1f, pid_kis = 0.0f, pid_kds = 0.8f; // Straight PID
+float pid_kpt = 0.0001f, pid_kit = 0.001f, pid_kdt = 0.01f; // Turn PID
 
 strategy_func_t current_strategy = NULL;
 
@@ -147,7 +158,7 @@ void telemetry_task(void *pvParameters) {
         // Digital Sensors: S:10101 (Center, R90, R, L90, L) - 1 if object SEEN
         // Line Sensors: L:RL (Right, Left) - 1 if whitespace SEEN
         snprintf(payload, sizeof(payload), 
-            "[%7.2f s] [M:%d W:%d] [S:%d%d%d%d%d L:%d%d] [State:%d] Pwr:%4d | Yaw:%6.1f | Ax:%5.1fG | Impact:%s\n", 
+            "[%7.2f s] [M:%d W:%d] [S:%d%d%d%d%d L:%d%d] [State:%d] Pwr:%4d | Yaw:%6.1f | Ax:%5.1fG | Impact:%s%s%s | PID:%.3f,%.3f,%.3f,%.3f,%.3f,%.3f | SE:%.0f\n", 
             (float)relative_ts / 1000.0f,
             mode,
             wing_mode,
@@ -161,7 +172,11 @@ void telemetry_task(void *pvParameters) {
             output_PID,
             g_imu_processed.yaw, 
             (float)(g_imu_processed.acc_x - g_imu_processed.acc_x_offset) / 2048.0f,
-            g_imu_processed.impact_detected ? "!!HIT!!" : (g_imu_processed.impact_side_left ? "SIDE-L" : (g_imu_processed.impact_side_right ? "SIDE-R" : "SAFE")));
+            g_imu_processed.impact_detected ? "!!HIT!! " : (g_imu_processed.impact_side_left ? "SIDE-L " : (g_imu_processed.impact_side_right ? "SIDE-R " : "SAFE ")),
+            g_imu_processed.robot_stalled ? "[STALL]" : "",
+            g_imu_processed.robot_flipped ? "[FLIPPED]" : "",
+            pid_kps, pid_kis, pid_kds, pid_kpt, pid_kit, pid_kdt,
+            g_imu_processed.stall_energy);
         
         int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (err < 0) {
@@ -173,6 +188,69 @@ void telemetry_task(void *pvParameters) {
 }
 
 // --==================== UTILITY FUNCTIONS =====================--
+
+esp_err_t ota_post_handler(httpd_req_t *req) {
+    esp_ota_handle_t ota_handle;
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    
+    if (esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    char buf[1024];
+    int received;
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+        int to_read = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
+        received = httpd_req_recv(req, buf, to_read);
+        if (received <= 0) {
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
+        if (esp_ota_write(ota_handle, buf, received) != ESP_OK) {
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+            return ESP_FAIL;
+        }
+        remaining -= received;
+    }
+
+    if (esp_ota_end(ota_handle) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA end failed");
+        return ESP_FAIL;
+    }
+
+    esp_ota_set_boot_partition(update_partition);
+    httpd_resp_sendstr(req, "OTA OK - rebooting");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+void start_ota_server(void) {
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 8080;
+    config.recv_wait_timeout = 30;  // large file needs longer timeout
+    config.send_wait_timeout = 30;
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "OTA server start failed");
+        return;
+    }
+
+    httpd_uri_t ota_uri = {
+        .uri      = "/ota",
+        .method   = HTTP_POST,
+        .handler  = ota_post_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &ota_uri);
+    ESP_LOGI(TAG, "OTA server ready on port 8080");
+}
 
 int percent_to_duty_cycle(int percent) {
     return (percent * BDC_MCPWM_DUTY_TICK_MAX) / 100;
@@ -426,9 +504,13 @@ void motor_controller_callback(void *arg) {
     
     state_t local_state;
     int local_output;
+    float kps_l, kis_l, kds_l, kpt_l, kit_l, kdt_l;
+    
     if (xSemaphoreTake(pidMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         local_state = state;
         local_output = output;
+        kps_l = pid_kps; kis_l = pid_kis; kds_l = pid_kds;
+        kpt_l = pid_kpt; kit_l = pid_kit; kdt_l = pid_kdt;
         xSemaphoreGive(pidMutex);
     } else {
         bdc_motor_brake(motor1);
@@ -436,14 +518,70 @@ void motor_controller_callback(void *arg) {
         return;
     }
 
+    static state_t prev_state = IDLE;
+    static float target_straight_yaw = 0.0f;
+    static float integral_straight = 0.0f;
+    static float prev_error_straight = 0.0f;
+    
+    static float integral_turn = 0.0f;
+    static float prev_error_turn = 0.0f;
+
+    // Reset Straight PID on state entry
+    if ((local_state == PATROL || local_state == ATTACK || local_state == RETREAT) && 
+        (prev_state != PATROL && prev_state != ATTACK && prev_state != RETREAT)) {
+        target_straight_yaw = g_imu_processed.yaw;
+        integral_straight = 0.0f;
+        prev_error_straight = 0.0f;
+    }
+    // Reset Turn PID on state entry
+    if (local_state == FOUND && prev_state != FOUND) {
+        integral_turn = 0.0f;
+        prev_error_turn = 0.0f;
+    }
+    prev_state = local_state;
+
     switch (local_state) {
         case PATROL:
         case ATTACK:
             bdc_motor_forward(motor1);
             bdc_motor_forward(motor2);
             {
-                int left_percent = clamp_percent_0_100((int)((float)local_output * LEFT_MOTOR_MULTIPLIER));
-                int right_percent = clamp_percent_0_100((int)((float)local_output * RIGHT_MOTOR_MULTIPLIER));
+                float error = target_straight_yaw - g_imu_processed.yaw;
+                integral_straight += error;
+                // Anti-windup
+                if(integral_straight > 500) integral_straight = 500;
+                if(integral_straight < -500) integral_straight = -500;
+                
+                float derivative = error - prev_error_straight;
+                prev_error_straight = error;
+                float correction = (kps_l * error) + (kis_l * integral_straight) + (kds_l * derivative);
+                
+                int left_percent = clamp_percent_0_100((int)(((float)local_output * LEFT_MOTOR_MULTIPLIER) - correction));
+                int right_percent = clamp_percent_0_100((int)(((float)local_output * RIGHT_MOTOR_MULTIPLIER) + correction));
+                
+                bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+                bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+            }
+            break;
+
+        case RETREAT:
+            bdc_motor_reverse(motor1);
+            bdc_motor_reverse(motor2);
+            {
+                float error = target_straight_yaw - g_imu_processed.yaw;
+                integral_straight += error;
+                float derivative = error - prev_error_straight;
+                prev_error_straight = error;
+                float correction = (kps_l * error) + (kis_l * integral_straight) + (kds_l * derivative);
+                
+                int base_l = 80, base_r = 80;
+                if (is_seen_left_line) { base_l = 100; base_r = 65; }
+                else if (is_seen_right_line) { base_l = 65; base_r = 100; }
+                
+                // When reversing, applying correction needs to be inverted compared to forward
+                int left_percent = clamp_percent_0_100((int)(base_l + correction));
+                int right_percent = clamp_percent_0_100((int)(base_r - correction));
+                
                 bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
                 bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
             }
@@ -451,16 +589,44 @@ void motor_controller_callback(void *arg) {
 
         case FOUND:
             {
-                int out_abs = abs(local_output);
+                // 1. output_PID < 0 means Turn Left. Turning Left means yaw_rate > 0 (CCW).
+                // Therefore, target_rate must have the OPPOSITE sign of local_output.
+                float target_rate = -((float)local_output / 100.0f) * 400.0f; 
+                
+                // 2. Calculate rate error
+                float error_t = target_rate - g_imu_processed.yaw_rate;
+                integral_turn += error_t;
+                
+                // Anti-windup
+                if(integral_turn > 1000) integral_turn = 1000;
+                if(integral_turn < -1000) integral_turn = -1000;
+                
+                float derivative_t = error_t - prev_error_turn;
+                prev_error_turn = error_t;
+                
+                float turn_correction = (kpt_l * error_t) + (kit_l * integral_turn) + (kdt_l * derivative_t);
+                if (turn_correction > 50.0f) turn_correction = 50.0f;
+                if (turn_correction < -50.0f) turn_correction = -50.0f;
+                
+                // 3. Apply correction to command
+                // To turn left faster (error_t is positive), cmd needs to be MORE negative.
+                // So we SUBTRACT the turn_correction.
+                float cmd = (float)local_output - turn_correction; 
+                
+                int cmd_int = (int)cmd;
+                int out_abs = abs(cmd_int);
+                
                 int left_percent = clamp_percent_0_100((int)((float)out_abs * LEFT_MOTOR_MULTIPLIER));
                 int right_percent = clamp_percent_0_100((int)((float)out_abs * RIGHT_MOTOR_MULTIPLIER));
-                if (output < 0) {
+                
+                if (cmd_int < 0) { // Arc left
                     bdc_motor_reverse(motor1);
                     bdc_motor_forward(motor2);
-                } else {
+                } else {           // Arc right
                     bdc_motor_forward(motor1);
                     bdc_motor_reverse(motor2);
                 }
+                
                 bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
                 bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
             }
@@ -471,33 +637,33 @@ void motor_controller_callback(void *arg) {
             {
                 bdc_motor_forward(motor1);
                 bdc_motor_forward(motor2);
-                float ratio = (local_state == ARCHING) ? 0.68f : 0.55f;
+                float ratio = (local_state == ARCHING) ? 0.77f : 0.55f;
+                
+                // Arching PID (Simplified turn matching while moving forward)
+                float target_arc_rate = (local_output > 0) ? 150.0f : -150.0f; // Target 150 deg/sec
+                float error_arc = target_arc_rate - g_imu_processed.yaw_rate;
+                float arc_corr = kpt_l * error_arc; 
+                
                 int base = abs(local_output);
                 if (local_output > 0) { // Arc RIGHT
-                    int left_percent = clamp_percent_0_100((int)((float)base * LEFT_MOTOR_MULTIPLIER));
-                    int right_percent = clamp_percent_0_100((int)((float)base * ratio * RIGHT_MOTOR_MULTIPLIER));
+                    int left_percent = clamp_percent_0_100(base + (int)arc_corr);
+                    int right_percent = clamp_percent_0_100((int)(base * ratio) - (int)arc_corr);
                     bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
                     bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
                 } else { // Arc LEFT
-                    int left_percent = clamp_percent_0_100((int)((float)base * ratio * LEFT_MOTOR_MULTIPLIER));
-                    int right_percent = clamp_percent_0_100((int)((float)base * RIGHT_MOTOR_MULTIPLIER));
+                    int left_percent = clamp_percent_0_100((int)(base * ratio) + (int)arc_corr);
+                    int right_percent = clamp_percent_0_100(base - (int)arc_corr);
                     bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
                     bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
                 }
             }
             break;
 
-        case RETREAT:
+        case REPOSITION:
             bdc_motor_reverse(motor1);
             bdc_motor_reverse(motor2);
-            if (is_seen_left_line) {
-                bdc_motor_set_speed(motor1, percent_to_duty_cycle(100));
-                bdc_motor_set_speed(motor2, percent_to_duty_cycle(65));
-            } else {
-                bdc_motor_set_speed(motor1, percent_to_duty_cycle(65));
-                bdc_motor_set_speed(motor2, percent_to_duty_cycle(100));
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            bdc_motor_set_speed(motor1, percent_to_duty_cycle(60));
+            bdc_motor_set_speed(motor2, percent_to_duty_cycle(100)); 
             break;
 
         case IDLE:
@@ -512,15 +678,36 @@ void run_strategy_task(void *arg) {
     bool initial_move_timer_started = false;
     while (1) {
         if (is_running && current_strategy != NULL) {
-            if (is_in_timed_retreat) {
+            if (is_evading_stall) {
+                int64_t elapsed_evade_time = (esp_timer_get_time() - evade_start_time) / 1000;
+                if (elapsed_evade_time < EVADE_DURATION_MS) {
+                    state_PID = REPOSITION;
+                } else {
+                    is_evading_stall = false;
+                }
+            } 
+            
+            else if (is_in_timed_retreat) {
                 int64_t elapsed_retreat_time = (esp_timer_get_time() - retreat_start_time) / 1000;
                 if (elapsed_retreat_time < RETREAT_DURATION_MS) {
                     state_PID = RETREAT;
                 } else {
-                    is_in_timed_retreat = false;
+                    // Backup done — turn 180° from the heading we had when we hit the line
+                    float target_yaw = retreat_entry_yaw + 135.0f;
+                    float yaw_error = target_yaw - g_imu_processed.yaw;
+                    // Normalize to [-180, 180]
+                    while (yaw_error > 180.0f)  yaw_error -= 360.0f;
+                    while (yaw_error < -180.0f) yaw_error += 360.0f;
+
+                    if (fabsf(yaw_error) > 15.0f) {
+                        state_PID = FOUND;
+                        output_PID = (yaw_error > 0) ? -70 : 70;
+                    } else {
+                        is_in_timed_retreat = false;
+                    }
                 }
             }
-            if (!is_in_timed_retreat) {
+            if (!is_in_timed_retreat && !is_evading_stall) {
                 read_sensors();
                 int64_t elapsed_retreat_ignore_time = (esp_timer_get_time() - retreat_ignore_time) / 1000;
 #ifdef USE_LINE_SENSORS
@@ -528,6 +715,7 @@ void run_strategy_task(void *arg) {
                     if (line_left) { is_seen_left_line = true; is_seen_right_line = false; }
                     else { is_seen_right_line = true; is_seen_left_line = false; }
                     is_in_timed_retreat = true;
+                    retreat_entry_yaw = g_imu_processed.yaw;
                     retreat_start_time = esp_timer_get_time();
                     retreat_ignore_time = esp_timer_get_time();
                     state_PID = RETREAT;
@@ -542,27 +730,27 @@ void run_strategy_task(void *arg) {
                 if (!initial_move_timer_started) {
                     initial_move_start_time = esp_timer_get_time();
                     initial_move_timer_started = true;
-                    // Reset yaw at the start of a timed/gyro move to have a fresh reference
-                    g_imu_processed.yaw = 0.0f;
                 }
                 
                 bool move_finished = false;
                 
                 // If it's a turn-based initial move, use Gyro
                 if (current_strategy == &strategy_hunter) {
-                    // Hunter usually does a scan turn. Let's make it scan 90 degrees.
-                    float diff = fabs(g_imu_processed.yaw);
-                    if (diff >= 90.0f) move_finished = true;
+                    // float diff = fabs(g_imu_processed.yaw);
+                    // if (diff >= 90.0f) move_finished = true;
+                    move_finished = true;
                 } 
                 else if (current_strategy == &strategy_matador_left || current_strategy == &strategy_matador_right) {
                     // Matador does an arc. Let's say 45 degrees of arcing.
+                    int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
                     float diff = fabs(g_imu_processed.yaw);
-                    if (diff >= 45.0f) move_finished = true;
+                    if (diff >= 174.0f || elapsed_time_ms >= initial_move_duration_ms) move_finished = true;
                 }
                 else if (current_strategy == &strategy_viper) {
                     // Viper initial move is a pre-turn. Let's say 30 degrees.
+                    int64_t elapsed_time_ms = (esp_timer_get_time() - initial_move_start_time) / 1000;
                     float diff = fabs(g_imu_processed.yaw);
-                    if (diff >= 30.0f) move_finished = true;
+                    if (diff >= 30.0f || elapsed_time_ms >= initial_move_duration_ms) move_finished = true;
                 }
                 else if (current_strategy == &strategy_dash_left || current_strategy == &strategy_dash_right) {
                     // For complex multi-stage moves, we check if the strategy itself 
@@ -645,12 +833,17 @@ void imu_task(void *arg) {
                     g_imu_processed.acc_y = ay;
                     g_imu_processed.acc_z = az;
                     
+                    // NEW — replace with this:
                     g_imu_processed.impact_magnitude = impact;
-                    if (impact > IMPACT_THRESHOLD_G && (now - last_impact_time) > IMPACT_COOLDOWN_MS * 1000) {
+
+                    // Gate impact: only valid during ATTACK or FOUND, not during initial move / patrol
+                    bool impact_state_valid = (state_PID == ATTACK || state_PID == FOUND) && initial_move_done;
+                    if (impact_state_valid &&
+                        impact > IMPACT_THRESHOLD_G &&
+                        (now - last_impact_time) > IMPACT_COOLDOWN_MS * 1000) {
+
                         g_imu_processed.impact_detected = true;
-                        
-                        // Determine side based on Acc Y (Lateral direction)
-                        if (ay_g > 1.0f) { // Significant lateral G
+                        if (ay_g > 1.0f) {
                             g_imu_processed.impact_side_left = true;
                             g_imu_processed.impact_side_right = false;
                         } else if (ay_g < -1.0f) {
@@ -660,7 +853,6 @@ void imu_task(void *arg) {
                             g_imu_processed.impact_side_left = false;
                             g_imu_processed.impact_side_right = false;
                         }
-
                         last_impact_time = now;
                     } else {
                         g_imu_processed.impact_detected = false;
@@ -668,26 +860,86 @@ void imu_task(void *arg) {
                         g_imu_processed.impact_side_right = false;
                     }
 
-                    // Flip Detection (Using Z acceleration)
-                    // If Z-axis is reversed or significantly weak while robot is supposedly on ground
-                    // Note: Z axis is UP, so nominal is ~ +1.0G (2048 LSB)
-                    // We check if Z is less than -0.5G (strongly pointing down) to confirm flip
-                    if (az_g < FLIP_THRESHOLD_Z) {
-                        g_imu_processed.robot_flipped = true;
+                    // Flip Detection — debounced: must persist for 120ms before declaring flip
+                    static int64_t flip_start_time = 0;
+                    if (az_g < -0.5f) {
+                        if (flip_start_time == 0) {
+                            flip_start_time = now;
+                        } else if ((now - flip_start_time) > 120000) { // 120ms in microseconds
+                            g_imu_processed.robot_flipped = true;
+                        }
                     } else {
+                        flip_start_time = 0;
                         g_imu_processed.robot_flipped = false;
                     }
 
-                    // Stall Detection
-                    // If we are at high power (calculated in state machine) but X accel is near zero
-                    // This is better checked in the strategy/supervisor level where 'output' is known.
-                    // For now, we update the raw state.
-                    if (fabsf(ax_g) < STALL_THRESHOLD_ACCEL && fabsf(ay_g) < STALL_THRESHOLD_ACCEL) {
-                         // Potential stall - let strategy verify with motor power
-                         g_imu_processed.robot_stalled = true; 
-                    } else {
-                         g_imu_processed.robot_stalled = false;
+                    // Smart stall detection — energy accumulator
+                    static float stall_energy = 0.0f;
+                    static int64_t attack_entry_time = 0;
+                    static state_t prev_state_for_stall = IDLE;
+                    static float yaw_at_stall_check = 0.0f;
+                    static int64_t stall_check_start = 0;
+                    static int64_t stuck_start = 0;
+
+                    float yaw_rate_abs = fabsf(g_imu_processed.yaw_rate);
+                    float ax_abs = fabsf(ax_g);
+                    float waste_score = yaw_rate_abs / (ax_abs * 50.0f + 1.0f);
+
+                    // Track when we enter ATTACK for grace period
+                    if (state_PID == ATTACK && prev_state_for_stall != ATTACK) {
+                        attack_entry_time = now;
                     }
+                    prev_state_for_stall = state_PID;
+
+                    bool in_grace_period = (now - attack_entry_time) < 300000; // 300ms
+
+                    if (is_running && state_PID == ATTACK && !in_grace_period) {
+                        // --- Detector 1: Rotational stall ---
+                        if (waste_score > 1.5f) {
+                            stall_energy += (waste_score - 1.5f) * dt * 200.0f;
+                        } else {
+                            stall_energy *= 0.95f;
+                        }
+                        if (stall_energy > 1000.0f) stall_energy = 1000.0f;
+
+                        // --- Detector 2: Linear stall (stuck, not spinning) ---
+                        if (stall_check_start == 0) {
+                            stall_check_start = now;
+                            yaw_at_stall_check = g_imu_processed.yaw;
+                        }
+                        if ((now - stall_check_start) > 300000) {
+                            float yaw_delta = fabsf(g_imu_processed.yaw - yaw_at_stall_check);
+                            if (yaw_delta < 5.0f) {
+                                if (stuck_start == 0) stuck_start = now;
+                            } else {
+                                stuck_start = 0;
+                            }
+                            stall_check_start = now;
+                            yaw_at_stall_check = g_imu_processed.yaw;
+                        }
+
+                        bool rotational_stall = (stall_energy > 500.0f);
+                        bool linear_stall = (stuck_start != 0 && (now - stuck_start) > 1200000);
+                        g_imu_processed.robot_stalled = rotational_stall || linear_stall;
+
+                    } else if (is_running && state_PID == ATTACK && in_grace_period) {
+                        // Grace period — decay only, never accumulate
+                        stall_energy *= 0.85f;
+                        if (stall_energy < 1.0f) stall_energy = 0.0f;
+                        stuck_start = 0;
+                        stall_check_start = 0;
+                        g_imu_processed.robot_stalled = false;
+                    } else {
+                        stall_energy *= 0.9f;
+                        if (stall_energy < 1.0f) stall_energy = 0.0f;
+                        stuck_start = 0;
+                        stall_check_start = 0;
+                        g_imu_processed.robot_stalled = false;
+                    }
+                    g_imu_processed.stall_energy = stall_energy;
+
+
+
 
                     // TESTING: Log when stall or flip is detected (throttled)
                     static int log_div = 0;
@@ -703,9 +955,12 @@ void imu_task(void *arg) {
 
                     float gz_raw = (int16_t)((data[12] << 8) | data[13]) - g_imu_processed.gyro_z_offset;
                     if (fabsf(gz_raw) < 15.0f) gz_raw = 0;
-                    g_imu_processed.yaw += (gz_raw / gyro_scale) * dt;
-                    if (g_imu_processed.yaw >= 360.0f) g_imu_processed.yaw -= 360.0f;
-                    if (g_imu_processed.yaw < 0.0f) g_imu_processed.yaw += 360.0f;
+                    float current_yaw_rate = gz_raw / gyro_scale;
+                    g_imu_processed.yaw_rate = current_yaw_rate; // Save for turning PID
+                    g_imu_processed.yaw += current_yaw_rate * dt;
+                    
+                    // Removed modulo to prevent graph snapping
+                    // Raw yaw will accumulate (e.g., 360, 720, -360) for a smooth continuous graph
                     
                     // Tilt detection: If gravity on Z is weak, robot is tilted
                     if (az_g < 0.5f) {
@@ -762,7 +1017,7 @@ static void mode_select_count() {
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     if (press_count < 1) press_count = 1;
-    if (press_count > 10) press_count = 10;
+    if (press_count > 13) press_count = 13;
     mode = press_count;
     blink_led(mode, 150);
     gpio_set_level(ONBOARD_LED, 1);
@@ -801,6 +1056,35 @@ static void wing_select_count() {
     blink_led(wing_mode, 150);
 }
 
+void udp_receive_task(void *pvParameters) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(3334);
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    
+    char rx_buffer[128];
+    while (1) {
+        struct sockaddr_in source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+        if (len > 0) {
+            rx_buffer[len] = 0;
+            float kps, kis, kds, kpt, kit, kdt;
+            // Parse "PID:2.5,0.0,0.5,1.0,0.0,0.1"
+            if (sscanf(rx_buffer, "PID:%f,%f,%f,%f,%f,%f", &kps, &kis, &kds, &kpt, &kit, &kdt) == 6) {
+                if (xSemaphoreTake(pidMutex, portMAX_DELAY)) {
+                    pid_kps = kps; pid_kis = kis; pid_kds = kds;
+                    pid_kpt = kpt; pid_kit = kit; pid_kdt = kdt;
+                    xSemaphoreGive(pidMutex);
+                }
+                ESP_LOGI("UDP", "Updated PIDs -> Straight: %.2f, %.2f, %.2f | Turn: %.2f, %.2f, %.2f", kps, kis, kds, kpt, kit, kdt);
+            }
+        }
+    }
+}
+
 // --========================= MAIN APPLICATION =========================--
 
 void app_main(void) {
@@ -812,7 +1096,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     wifi_init_softap();
+    start_ota_server();
+
     xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);
+    xTaskCreate(udp_receive_task, "udp_rx", 4096, NULL, 5, NULL); // <--- NEW
 
     setup();
     servo_init();
@@ -821,7 +1108,7 @@ void app_main(void) {
     
     // Turn off LED and wait for button press to start IMU init/calibration
     gpio_set_level(ONBOARD_LED, 0);
-    ESP_LOGI(TAG, "Press MODE button once to start IMU calibration...");
+    ESP_LOGI(TAG, "Press MODE button once to start IMU calibration (WIFI YEY)...");
     
     while (gpio_get_level(MODE_BUTTON) != 0) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -843,8 +1130,10 @@ void app_main(void) {
     while (!gpio_get_level(START_STOP_MODULE)) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    g_imu_processed.yaw = 0.0f; // Final reset before combat
     is_running = true;
     #else
+    g_imu_processed.yaw = 0.0f; // Final reset before combat
     is_running = true;
     #endif
 
@@ -863,6 +1152,9 @@ void app_main(void) {
         case 8: current_strategy = &strategy_dash_right; initial_move_duration_ms = 0; break;
         case 9: current_strategy = &strategy_viper; initial_move_duration_ms = 0; break;
         case 10: current_strategy = &strategy_test_90deg_turns; initial_move_duration_ms = 0; break;
+        case 11: current_strategy = &strategy_test_straight; initial_move_duration_ms = 0; break; // <--- NEW
+        case 12: current_strategy = &strategy_test_turn; initial_move_duration_ms = 0; break;     // <--- NEW
+        case 13: current_strategy = &strategy_test_forward_180; initial_move_duration_ms = 0; break; // <--- NEW MODE 13
         default: current_strategy = &strategy_bulldozer; initial_move_duration_ms = BULLDOZER_INITIAL_MOVE_DURATION_MS; break;
     }
 

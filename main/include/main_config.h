@@ -34,8 +34,8 @@
 
 #define BULLDOZER_INITIAL_MOVE_DURATION_MS      400
 #define HUNTER_INITIAL_MOVE_DURATION_MS          25
-#define MATADOR_INITIAL_MOVE_DURATION_MS         250
-#define RETREAT_DURATION_MS                      25
+#define MATADOR_INITIAL_MOVE_DURATION_MS         2500
+#define RETREAT_DURATION_MS                      250
 #define EDGE_WALKER_INITIAL_TURN_DURATION_MS     2000 
 #define VIPER_INITIAL_MOVE_DURATION_MS           300
 #define ADAPTIVE_HUNTER_INITIAL_MOVE_DURATION_MS 25
@@ -48,11 +48,11 @@
 #define VIPER_ARCING_SPEED 100
 
 #define RETREAT_IGNORE_MS 125
-#define PATROL_SPEED 55
+#define PATROL_SPEED 45
 #define ARCING_SPEED 100 
 
 // Logic Toggles
-// #define USE_LINE_SENSORS        // Comment this out to disable line sensors
+#define USE_LINE_SENSORS        // Comment this out to disable line sensors
 #define SENSOR_READING_DELAY 15
 
 #define SERVO_FREQ 50
@@ -127,7 +127,7 @@
 #define ACTIVE_DEBUG            
 #define BLACK_FIELD 0           
 #define DOUBLE_PRESS_TIMEOUT_MS 1000 
-#define ENEMY_CONFIRMATION_THRESHOLD 7
+#define ENEMY_CONFIRMATION_THRESHOLD 2
 
 #define MOTOR_CONTROL_TIMER_PERIOD  15      
 #define SENSOR_READING_DELAY_VAL    10      

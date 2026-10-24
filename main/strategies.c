@@ -1,5 +1,8 @@
 #include "strategies.h"
 
+extern bool is_evading_stall;
+extern int64_t evade_start_time;
+
 void strategy_bulldozer(void) {
     static bool impact_confirmed = false;
 
@@ -33,13 +36,14 @@ void strategy_bulldozer(void) {
 }
 
 void strategy_hunter(void) {
-    if (!initial_move_done) {
-        ESP_LOGI("Hunter", "Executing initial scan...");
-        state_PID = FOUND;
-        output_PID = -70; // Turn left
-    }
-    else {
-        read_sensors();
+    // if (!initial_move_done) {
+    //     state_PID = ATTACK;
+    //     output_PID = PATROL_SPEED;
+    //     return;
+    // }
+    // else {
+    {
+        // read_sensors();
         bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
         #ifdef ROBOT_VECHI
         #ifdef USE_LATERAL_SENSORS
@@ -49,49 +53,59 @@ void strategy_hunter(void) {
         );
 
         if (is_enemy_present) {
-            // Instant reaction - no confirmation threshold
-            enemy_seen_counter = ENEMY_CONFIRMATION_THRESHOLD;
-        } else {
-            enemy_seen_counter = 0;
+            if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD)
+                enemy_seen_counter++;
+        } 
+        static int missed_frames = 0;
+        if (++missed_frames >= 3) {
+            if (enemy_seen_counter > 0) enemy_seen_counter--;
+            missed_frames = 0;
         }
-
         if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) {
-            // Check for side-swipes during attack
+            if (g_imu_processed.robot_flipped) { state_PID = IDLE; return; }
+            if (g_imu_processed.robot_stalled) {
+                is_evading_stall = true;
+                evade_start_time = esp_timer_get_time();
+                state_PID = REPOSITION;
+                return;
+            }
+
             if (g_imu_processed.impact_detected) {
                 if (g_imu_processed.impact_side_left) {
-                    ESP_LOGW("Hunter", "Side impact LEFT! Adjusting...");
-                    state_PID = FOUND;
-                    output_PID = -90; // Hard turn left to face opponent
-                    return;
+                    state_PID = FOUND; output_PID = -90; return;
                 } else if (g_imu_processed.impact_side_right) {
-                    ESP_LOGW("Hunter", "Side impact RIGHT! Adjusting...");
-                    state_PID = FOUND;
-                    output_PID = 90; // Hard turn right to face opponent
-                    return;
+                    state_PID = FOUND; output_PID = 90; return;
                 }
             }
 
-            if (dist_center && dist_l && dist_r) {
+            // Priority 1: center + both sides = full commit, no turning
+            if (dist_center) {
                 state_PID = ATTACK;
                 output_PID = 100;
-            } else if (dist_l90 || dist_l
-            #ifdef ROBOT_VECHI
-            #ifdef USE_LATERAL_SENSORS
-                || dist_lf
-            #endif
-            #endif
-            ) {
+                return;
+            }
+
+            // Priority 2: off-center but visible — snap turn then attack
+            if (dist_l90) {
+                // Far left — hard turn
                 state_PID = FOUND;
-                output_PID = -70;
-            } else if (dist_r90 || dist_r
-            #ifdef ROBOT_VECHI
-            #ifdef USE_LATERAL_SENSORS
-                || dist_rf
-            #endif
-            #endif
-            ) {
+                output_PID = -80;
+            } else if (dist_l) {
+                // Slight left — moderate turn, still moving
                 state_PID = FOUND;
-                output_PID = 70;
+                output_PID = -60;
+            } else if (dist_r90) {
+                // Far right — hard turn
+                state_PID = FOUND;
+                output_PID = 80;
+            } else if (dist_r) {
+                // Slight right — moderate turn
+                state_PID = FOUND;
+                output_PID = 60;
+            } else {
+                // Had confirmation but lost sight — keep last direction briefly
+                state_PID = ATTACK;
+                output_PID = 100;
             }
         } else {
             state_PID = PATROL;
@@ -121,7 +135,7 @@ void strategy_matador_right(void) {
 }
 
 void strategy_calibration_turn(void) {
-    read_sensors();
+    // read_sensors();
     bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
     #ifdef ROBOT_VECHI
     #ifdef USE_LATERAL_SENSORS
@@ -190,7 +204,7 @@ void strategy_calibration_turn(void) {
 }
 
 void strategy_viper(void) {
-    read_sensors();
+    // read_sensors();
     bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
     #ifdef ROBOT_VECHI
     #ifdef USE_LATERAL_SENSORS
@@ -316,8 +330,8 @@ void strategy_dash_left(void) {
     }
     static int stage = 0; 
     static int64_t stage_start = 0;
+    static float turn_start_angle_l = 0;
     const int pre_straight_ms = 150;
-    const int turn_ms = 600; // Increased safety timeout
     const int post_straight_ms = 175;
 
     if (stage == 0) {
@@ -331,33 +345,54 @@ void strategy_dash_left(void) {
     if (stage == 1) {
         state_PID = ATTACK;
         output_PID = 100;
+        turn_start_angle_l = g_imu_processed.yaw; // Keep updating until we jump to stage 2
         if (elapsed >= pre_straight_ms) {
             stage = 2;
             stage_start = esp_timer_get_time();
-            g_imu_processed.yaw = 0; // Reset for precise turn
         }
     } else if (stage == 2) {
-        state_PID = FOUND;
-        output_PID = -60; // Left turn
-        float angle = g_imu_processed.yaw; // Current relative yaw
+        float relative_yaw = g_imu_processed.yaw - turn_start_angle_l;
+        float error = 90.0f - relative_yaw; // Target is +90.0 degrees
         
-        // We want a left turn (negative yaw growth). 
-        // Check if we are between 85 and 105 degrees in the CORRECT direction.
-        // Also ensure a minimum time to avoid noise floor triggers.
-        if ((angle <= -85.0f && angle >= -105.0f && elapsed > 100) || elapsed >= turn_ms) { 
-            ESP_LOGI("DashL", "Turn complete at %.2f deg (elapsed %lld ms)", angle, elapsed);
+        static float integral = 0;
+        static float prev_error = 0;
+        integral += error;
+        float derivative = error - prev_error;
+        prev_error = error;
+        
+        float TURN_KP = 2.0f;
+        float TURN_KI = 0.01f;
+        float TURN_KD = 0.5f;
+        
+        float correction = (TURN_KP * error) + (TURN_KI * integral) + (TURN_KD * derivative);
+        
+        // Target is +90.0 degrees.
+        if ((fabs(error) < 5.0f && fabs(derivative) < 1.0f) || elapsed >= 1500) { 
+            ESP_LOGI("DashL", "Turn complete at %.2f deg (rel: %.2f)", g_imu_processed.yaw, relative_yaw);
             stage = 3;
             stage_start = esp_timer_get_time();
+            integral = 0;
+            prev_error = 0;
+        } else {
+            int pwr = -correction; 
+            if (pwr < -100) pwr = -100;
+            if (pwr > 100) pwr = 100;
+            if (pwr < 0 && pwr > -35) pwr = -35; 
+            if (pwr > 0 && pwr < 35) pwr = 35;
+            
+            state_PID = FOUND;
+            output_PID = pwr; 
         }
     } else if (stage == 3) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= post_straight_ms) {
             stage = 0; // Reset for next time
+            stage_start = 0;
+            turn_start_angle_l = 0;
             ESP_LOGI("DashL", "Dash-left complete. Switching to Hunter.");
             current_strategy = &strategy_hunter;
-            initial_move_done = false;
-            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+            initial_move_done = true;
         }
     }
 }
@@ -370,8 +405,8 @@ void strategy_dash_right(void) {
     }
     static int stage = 0;
     static int64_t stage_start = 0;
+    static float turn_start_angle_r = 0;
     const int pre_straight_ms = 150;
-    const int turn_ms = 600; // Increased safety timeout
     const int post_straight_ms = 175;
 
     if (stage == 0) {
@@ -385,32 +420,54 @@ void strategy_dash_right(void) {
     if (stage == 1) {
         state_PID = ATTACK;
         output_PID = 100;
+        turn_start_angle_r = g_imu_processed.yaw; // Latch until jump
         if (elapsed >= pre_straight_ms) {
             stage = 2;
             stage_start = esp_timer_get_time();
-            g_imu_processed.yaw = 0; // Reset for precise turn
         }
     } else if (stage == 2) {
-        state_PID = FOUND;
-        output_PID = 60; // Right turn
-        float angle = g_imu_processed.yaw; 
-
-        // We want a right turn (positive yaw growth).
-        // Check if we are between 85 and 105 degrees in the CORRECT direction.
-        if ((angle >= 85.0f && angle <= 105.0f && elapsed > 100) || elapsed >= turn_ms) { 
-            ESP_LOGI("DashR", "Turn complete at %.2f deg (elapsed %lld ms)", angle, elapsed);
+        float relative_yaw = g_imu_processed.yaw - turn_start_angle_r;
+        float error = -90.0f - relative_yaw; // Target is -90.0 degrees
+        
+        static float integral = 0;
+        static float prev_error = 0;
+        integral += error;
+        float derivative = error - prev_error;
+        prev_error = error;
+        
+        float TURN_KP = 2.0f;
+        float TURN_KI = 0.01f;
+        float TURN_KD = 0.5f;
+        
+        float correction = (TURN_KP * error) + (TURN_KI * integral) + (TURN_KD * derivative);
+        
+        // Target is -90.0 degrees.
+        if ((fabs(error) < 5.0f && fabs(derivative) < 1.0f) || elapsed >= 1500) { 
+            ESP_LOGI("DashR", "Turn complete at %.2f deg (rel: %.2f)", g_imu_processed.yaw, relative_yaw);
             stage = 3;
             stage_start = esp_timer_get_time();
+            integral = 0;
+            prev_error = 0;
+        } else {
+            int pwr = -correction; 
+            if (pwr < -100) pwr = -100;
+            if (pwr > 100) pwr = 100;
+            if (pwr < 0 && pwr > -35) pwr = -35; 
+            if (pwr > 0 && pwr < 35) pwr = 35;
+            
+            state_PID = FOUND;
+            output_PID = pwr; 
         }
     } else if (stage == 3) {
         state_PID = ATTACK;
         output_PID = 100;
         if (elapsed >= post_straight_ms) {
             stage = 0; // Reset
+            stage_start = 0;
+            turn_start_angle_r = 0;
             ESP_LOGI("DashR", "Dash-right complete. Switching to Hunter.");
             current_strategy = &strategy_hunter;
-            initial_move_done = false;
-            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+            initial_move_done = true;
         }
     }
 }
@@ -453,6 +510,7 @@ void strategy_bounce_feint(void) {
     }
     static int stage = 0;
     static int64_t stage_start = 0;
+    static float turn_start_angle = 0;
     const int forward_ms = 150;
     const int turn_ms = 300;
     const int forward2_ms = 200;
@@ -460,14 +518,14 @@ void strategy_bounce_feint(void) {
     int64_t elapsed = (esp_timer_get_time() - stage_start) / 1000;
     if (stage == 1) {
         state_PID = ATTACK; output_PID = 100; 
+        turn_start_angle = g_imu_processed.yaw;
         if (elapsed >= forward_ms) { 
             stage = 2; 
             stage_start = esp_timer_get_time(); 
-            g_imu_processed.yaw = 0; // Reset for turn
         }
     } else if (stage == 2) {
-        state_PID = FOUND; output_PID = (rand() & 1) ? 60 : -60; 
-        float angle = fabs(g_imu_processed.yaw);
+        state_PID = FOUND; output_PID = (rand() & 1) ? 100 : -100; 
+        float angle = fabs(g_imu_processed.yaw - turn_start_angle);
         if ((angle >= 45.0f && elapsed > 50) || elapsed >= turn_ms) { // Quick 45 deg feint
             stage = 3; 
             stage_start = esp_timer_get_time(); 
@@ -570,7 +628,7 @@ void strategy_staggered_burst(void) {
     }
 }
 
-void turn_degrees(float target_relative_degrees, int speed) {
+void turn_degrees(float target_relative_degrees, int max_speed) {
     static float start_yaw = -1;
     static float target_yaw = -1;
     static bool is_turning = false;
@@ -578,24 +636,184 @@ void turn_degrees(float target_relative_degrees, int speed) {
     if (!is_turning) {
         start_yaw = g_imu_processed.yaw;
         target_yaw = start_yaw + target_relative_degrees;
-        while (target_yaw >= 360.0f) target_yaw -= 360.0f;
-        while (target_yaw < 0.0f) target_yaw += 360.0f;
         is_turning = true;
     }
 
-    float diff = fabs(g_imu_processed.yaw - target_yaw);
-    if (diff > 180.0f) diff = 360.0f - diff;
+    float error = target_yaw - g_imu_processed.yaw; 
 
-    if (diff > 5.0f) {
+    // Smooth approach tolerance
+    if (fabs(error) > 2.0f) { 
         state_PID = FOUND;
-        output_PID = (target_relative_degrees > 0) ? -speed : speed;
+        
+        // Softer positional gain to prevent aggressive stutter
+        float p_gain = 1.0f; 
+        float requested_speed = fabs(error) * p_gain;
+        
+        if (requested_speed > max_speed) requested_speed = max_speed;
+        
+        // Increased minimum speed to prevent stalling out at the very end of the turn
+        if (requested_speed < 25) requested_speed = 25; 
+
+        output_PID = (error > 0) ? -requested_speed : requested_speed;
     } else {
         state_PID = IDLE;
         output_PID = 0;
         is_turning = false;
-        // This would usually transition to a next state
     }
 }
+
+void strategy_test_forward_180(void) {
+    if (initial_move_done) {
+        state_PID = IDLE; output_PID = 0; return;
+    }
+
+    static int phase = 0;
+    static int64_t phase_start = 0;
+    static float ideal_target_yaw = 0.0f; // Tracks exact 0 or 180 mathematically
+    
+    int64_t now = esp_timer_get_time();
+
+    if (phase == 0) {
+        if (phase_start == 0) phase_start = now;
+        state_PID = IDLE; output_PID = 0;
+        
+        if ((now - phase_start) / 1000 > 2000) {
+            ideal_target_yaw = g_imu_processed.yaw; // Lock initial 0 degree baseline
+            phase = 1;
+            phase_start = now;
+        }
+    }
+    else if (phase == 1) { // Drive Forward
+        state_PID = ATTACK;
+        output_PID = 60; 
+        if ((now - phase_start) / 1000 > 1500) { 
+            phase = 2;
+            phase_start = now;
+        }
+    }
+    else if (phase == 2) { // Pause
+        state_PID = IDLE; output_PID = 0;
+        if ((now - phase_start) / 1000 > 500) { 
+            phase = 3;
+            ideal_target_yaw += 180.0f; // Set mathematical 180 target
+        }
+    }
+    else if (phase == 3) { // Turn +180 Absolute
+        float error = ideal_target_yaw - g_imu_processed.yaw;
+        if (fabs(error) > 2.0f) {
+            state_PID = FOUND;
+            float req_speed = fabs(error) * 1.0f;
+            if (req_speed > 60) req_speed = 60;
+            if (req_speed < 25) req_speed = 25;
+            output_PID = (error > 0) ? -req_speed : req_speed;
+        } else {
+            state_PID = IDLE; output_PID = 0;
+            phase = 4;
+            phase_start = now;
+        }
+    }
+    else if (phase == 4) { // Pause
+        state_PID = IDLE; output_PID = 0;
+        if ((now - phase_start) / 1000 > 500) { 
+            phase = 5;
+            phase_start = now;
+        }
+    }
+    else if (phase == 5) { // Drive Forward Backwards
+        state_PID = ATTACK;
+        output_PID = 60; 
+        if ((now - phase_start) / 1000 > 1500) { 
+            phase = 6;
+            phase_start = now;
+        }
+    }
+    else if (phase == 6) { // Pause
+        state_PID = IDLE; output_PID = 0;
+        if ((now - phase_start) / 1000 > 500) { 
+            phase = 7;
+            ideal_target_yaw -= 180.0f; // Set mathematical 0 target
+        }
+    }
+    else if (phase == 7) { // Turn -180 Absolute
+        float error = ideal_target_yaw - g_imu_processed.yaw;
+        if (fabs(error) > 2.0f) {
+            state_PID = FOUND;
+            float req_speed = fabs(error) * 1.0f;
+            if (req_speed > 60) req_speed = 60;
+            if (req_speed < 25) req_speed = 25;
+            output_PID = (error > 0) ? -req_speed : req_speed;
+        } else {
+            state_PID = IDLE; output_PID = 0;
+            phase = 1; // Loop back to start
+            phase_start = now;
+        }
+    }
+}
+
+void strategy_test_straight(void) {
+    if (initial_move_done) {
+        state_PID = IDLE; output_PID = 0; return;
+    }
+    // Command continuous straight attack
+    state_PID = ATTACK;
+    output_PID = 60; // 60% power straight
+}
+
+void strategy_test_turn(void) {
+    if (initial_move_done) {
+        state_PID = IDLE; output_PID = 0; return;
+    }
+    
+    static int phase = 0;
+    static int64_t phase_start = 0;
+    int64_t now = esp_timer_get_time();
+
+    if (phase == 0) {
+        // State 0: Paused at starting angle (0)
+        if (phase_start == 0) phase_start = now;
+        state_PID = IDLE; 
+        output_PID = 0;
+        
+        if ((now - phase_start) / 1000 > 2000) { // 2 seconds pause
+            phase = 1;
+            phase_start = 0;
+            ESP_LOGI("Test", "Phase 1: Turning +90 degrees");
+        }
+    } 
+    else if (phase == 1) {
+        // State 1: Execute +90 turn at 50% target turn rate
+        // turn_degrees sets state to FOUND, passing through your Turn Rate PID
+        turn_degrees(90.0f, 50); 
+        
+        if (state_PID == IDLE) { // turn_degrees sets state to IDLE when target is reached
+            phase = 2;
+            phase_start = now;
+            ESP_LOGI("Test", "Phase 2: Reached +90. Pausing for 2s.");
+        }
+    } 
+    else if (phase == 2) {
+        // State 2: Paused at 90
+        state_PID = IDLE; 
+        output_PID = 0;
+        
+        if ((now - phase_start) / 1000 > 2000) { // 2 seconds pause
+            phase = 3;
+            phase_start = 0;
+            ESP_LOGI("Test", "Phase 3: Turning back to 0 (-90 degrees)");
+        }
+    } 
+    else if (phase == 3) {
+        // State 3: Execute -90 turn back to original position
+        turn_degrees(-90.0f, 50); 
+        
+        if (state_PID == IDLE) {
+            phase = 0;
+            phase_start = 0;
+            ESP_LOGI("Test", "Phase 0: Reached 0. Looping.");
+        }
+    }
+}
+
 
 void strategy_test_90deg_turns(void) {
     static int phase = 0;
