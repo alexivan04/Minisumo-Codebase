@@ -36,7 +36,16 @@ extern uint8_t dist_rf, dist_lf;
 #endif
 extern uint8_t line_right, line_left;
 
+// bool to check if the robot retreated from the edge to cancel the arching move
+extern bool was_retreated;
+extern bool turning_after_retreat;
+extern bool matador_arching_right;
 extern int enemy_seen_counter;
+extern bool hunter_turn_active;
+extern bool hunter_turn_waiting_for_clear;
+extern int hunter_turn_command;
+extern float hunter_turn_last_yaw;
+extern float hunter_turn_degrees;
 extern bool initial_move_done;
 extern int initial_move_duration_ms;
 extern int64_t last_enemy_seen_time;
@@ -59,6 +68,10 @@ void strategy_random_micro(void);
 void strategy_prescan_aim(void);
 void strategy_staggered_burst(void);
 void strategy_viper(void);
+
+void strategy_test_straight(void);
+void strategy_test_turn(void);
+void strategy_test_forward_180(void); // <--- ADD THIS LINE
 
 // Precision Movement
 void turn_degrees(float target_relative_degrees, int speed);
