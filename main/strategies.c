@@ -158,74 +158,146 @@ void strategy_matador_right(void) {
     else strategy_hunter();
 }
 
-void strategy_calibration_turn(void) {
-    // read_sensors();
-    bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
-    #ifdef ROBOT_VECHI
-    #ifdef USE_LATERAL_SENSORS
-        || dist_rf || dist_lf
-    #endif
-    #endif
-    );
+// void strategy_calibration_turn(void) {
+//     // read_sensors();
+//     bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
+//     #ifdef ROBOT_VECHI
+//     #ifdef USE_LATERAL_SENSORS
+//         || dist_rf || dist_lf
+//     #endif
+//     #endif
+//     );
 
-    if (is_enemy_present) {
-        if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
-            enemy_seen_counter++;
-        }
-    } else {
-        enemy_seen_counter = 0;
-    }
+//     if (is_enemy_present) {
+//         if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
+//             enemy_seen_counter++;
+//         }
+//     } else {
+//         enemy_seen_counter = 0;
+//     }
 
-    static int calibrating = 0;
-    static int64_t calibrate_start = 0;
-    int64_t now = esp_timer_get_time();
+//     static int calibrating = 0;
+//     static int64_t calibrate_start = 0;
+//     int64_t now = esp_timer_get_time();
 
-    if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD || calibrating) {
-        if (!calibrating) {
-            calibrating = 1;
-            calibrate_start = now;
-            ESP_LOGI("Calibration", "Starting timed calibration aiming for %d ms", CALIBRATION_AIM_MS);
-        }
+//     if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD || calibrating) {
+//         if (!calibrating) {
+//             calibrating = 1;
+//             calibrate_start = now;
+//             ESP_LOGI("Calibration", "Starting timed calibration aiming for %d ms", CALIBRATION_AIM_MS);
+//         }
 
-        float error = 0.0;
-        if (dist_center)       { error = 0.0; }
-        else if (dist_l90)     { error = -2.0;}
-        else if (dist_l)       { error = -1.0;}
-        else if (dist_r90)     { error = 2.0; }
-        else if (dist_r)       { error = 1.0; }
+//         float error = 0.0;
+//         if (dist_center)       { error = 0.0; }
+//         else if (dist_l90)     { error = -2.0;}
+//         else if (dist_l)       { error = -1.0;}
+//         else if (dist_r90)     { error = 2.0; }
+//         else if (dist_r)       { error = 1.0; }
+//         #ifdef ROBOT_VECHI
+//         #ifdef USE_LATERAL_SENSORS
+//         else if (dist_lf)      { error = -0.5;}
+//         else if (dist_rf)      { error = 0.5; }
+//         #endif
+//         #endif
+
+//         if (error == 0.0) {
+//             state_PID = IDLE;
+//             output_PID = 0;
+//         } else {
+//             state_PID = FOUND;
+//             int turn_speed = (int)(Kp * fabs(error));
+//             if (turn_speed < MIN_TURN_SPEED) turn_speed = MIN_TURN_SPEED;
+//             if (turn_speed > MAX_TURN_SPEED) turn_speed = MAX_TURN_SPEED;
+//             output_PID = (error < 0) ? -turn_speed : turn_speed;
+//         }
+
+//         int64_t elapsed_ms = (now - calibrate_start) / 1000;
+//         if (elapsed_ms >= CALIBRATION_AIM_MS) { // CALIBRATION_AIM_MS
+//             calibrating = 0;
+//             ESP_LOGI("Calibration", "Calibration complete - switching to Hunter (attack)");
+//             current_strategy = &strategy_hunter;
+//             initial_move_done = false;
+//             initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
+//             return;
+//         }
+//     } else {
+//         calibrating = 0;
+//         state_PID = IDLE;
+//         output_PID = 0;
+//     }
+// }
+
+    void strategy_calibration_turn(void) {
+        bool is_enemy_present = (dist_center || dist_l90 || dist_l || dist_r90 || dist_r
         #ifdef ROBOT_VECHI
         #ifdef USE_LATERAL_SENSORS
-        else if (dist_lf)      { error = -0.5;}
-        else if (dist_rf)      { error = 0.5; }
+            || dist_rf || dist_lf
         #endif
         #endif
+        );
 
-        if (error == 0.0) {
+        if (is_enemy_present) {
+            if (enemy_seen_counter < ENEMY_CONFIRMATION_THRESHOLD) {
+                enemy_seen_counter++;
+            }
+        } 
+        static int missed_frames = 0;
+        if (!is_enemy_present) {
+            if (++missed_frames >= 3) {
+                if (enemy_seen_counter > 0) enemy_seen_counter--;
+                missed_frames = 0;
+            }
+        } else {
+            missed_frames = 0;
+        }
+
+        // Smoothing the commands
+        static float smoothed_output = 0.0f;
+        float target_output = 0.0f;
+
+        if (enemy_seen_counter >= ENEMY_CONFIRMATION_THRESHOLD) {
+            float error = 0.0;
+        
+            if (dist_center)       { error = 0.0; }
+            else if (dist_l90)     { error = -2.0;}
+            else if (dist_l)       { error = -1.0;}
+            else if (dist_r90)     { error = 2.0; }
+            else if (dist_r)       { error = 1.0; }
+            #ifdef ROBOT_VECHI
+            #ifdef USE_LATERAL_SENSORS
+            else if (dist_lf)      { error = -0.5;}
+            else if (dist_rf)      { error = 0.5; }
+            #endif
+            #endif
+            
+            if (error == 0.0) {
+                
+                state_PID = ATTACK;
+                output_PID = 100;
+                smoothed_output = 0.0f; 
+            } else {
+                state_PID = FOUND;
+                int turn_speed = (int)(Kp * fabs(error));
+                if (turn_speed < MIN_TURN_SPEED) turn_speed = MIN_TURN_SPEED;
+                if (turn_speed > MAX_TURN_SPEED) turn_speed = MAX_TURN_SPEED;
+                target_output = (error < 0) ? -turn_speed : turn_speed;
+            }
+        } else {
             state_PID = IDLE;
             output_PID = 0;
-        } else {
-            state_PID = FOUND;
-            int turn_speed = (int)(Kp * fabs(error));
-            if (turn_speed < MIN_TURN_SPEED) turn_speed = MIN_TURN_SPEED;
-            if (turn_speed > MAX_TURN_SPEED) turn_speed = MAX_TURN_SPEED;
-            output_PID = (error < 0) ? -turn_speed : turn_speed;
+            target_output = 0.0f;
+            smoothed_output = 0.0f;
         }
 
-        int64_t elapsed_ms = (now - calibrate_start) / 1000;
-        if (elapsed_ms >= CALIBRATION_AIM_MS) {
-            calibrating = 0;
-            ESP_LOGI("Calibration", "Calibration complete - switching to Hunter (attack)");
-            current_strategy = &strategy_hunter;
-            initial_move_done = false;
-            initial_move_duration_ms = HUNTER_INITIAL_MOVE_DURATION_MS;
-            return;
+        if (state_PID == FOUND) {
+            float smoothing_factor = 0.4f; 
+            smoothed_output = (smoothing_factor * target_output) + ((1.0f - smoothing_factor) * smoothed_output);
+            output_PID = (int)smoothed_output;
+        } else if (state_PID != ATTACK) {
+            output_PID = (int)target_output;
         }
-    } else {
-        calibrating = 0;
-        state_PID = IDLE;
-        output_PID = 0;
-    }
 }
+
 
 void strategy_viper(void) {
     // read_sensors();
@@ -404,7 +476,9 @@ void strategy_dash_left(void) {
             if (pwr < 0 && pwr > -35) pwr = -35; 
             if (pwr > 0 && pwr < 35) pwr = 35;
             
-            state_PID = FOUND;
+            // Avoid the same turn as the enemy found turn
+            state_PID = PURE_TURN; 
+            output_PID = pwr;
             output_PID = pwr; 
         }
     } else if (stage == 3) {

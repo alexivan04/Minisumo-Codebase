@@ -619,7 +619,7 @@ void motor_controller_callback(void *arg) {
                 int found_state_elapsed_ms = (esp_timer_get_time() - enemy_found_time) / 1000;
                 if (!turning_after_retreat &&
                     local_state == FOUND &&
-                    found_state_elapsed_ms < 20) {
+                    found_state_elapsed_ms < 3) {
                     bdc_motor_forward(motor1);
                     bdc_motor_forward(motor2);
 
@@ -735,7 +735,41 @@ void motor_controller_callback(void *arg) {
             bdc_motor_set_speed(motor1, percent_to_duty_cycle(60));
             bdc_motor_set_speed(motor2, percent_to_duty_cycle(100)); 
             break;
-
+        case PURE_TURN:
+        {
+            float target_rate = -((float)local_output / 100.0f) * 400.0f; 
+            float error_t = target_rate - g_imu_processed.yaw_rate;
+            integral_turn += error_t;
+    
+            if(integral_turn > 1000) integral_turn = 1000;
+            if(integral_turn < -1000) integral_turn = -1000;
+    
+            float derivative_t = error_t - prev_error_turn;
+            prev_error_turn = error_t;
+    
+            float turn_correction = (kpt_l * error_t) + (kit_l * integral_turn) + (kdt_l * derivative_t);
+            if (turn_correction > 50.0f) turn_correction = 50.0f;
+            if (turn_correction < -50.0f) turn_correction = -50.0f;
+    
+            float cmd = (float)local_output - turn_correction; 
+            int cmd_int = (int)cmd;
+            int out_abs = abs(cmd_int);
+    
+            int left_percent = clamp_percent_0_100((int)((float)out_abs * LEFT_MOTOR_MULTIPLIER));
+            int right_percent = clamp_percent_0_100((int)((float)out_abs * RIGHT_MOTOR_MULTIPLIER));
+        
+            if (cmd_int < 0) {
+                bdc_motor_reverse(motor1);
+                bdc_motor_forward(motor2);
+            } else {           
+                bdc_motor_forward(motor1);
+                bdc_motor_reverse(motor2);
+            }
+    
+            bdc_motor_set_speed(motor1, percent_to_duty_cycle(left_percent));
+            bdc_motor_set_speed(motor2, percent_to_duty_cycle(right_percent));
+        }
+            break;
         case IDLE:
         default:
             bdc_motor_brake(motor1);
