@@ -7,5 +7,5 @@ idf_component_register(SRCS "core/src/vl53l0x_api_calibration.c"
                             "platform/src/vl53l0x_esp32.c"
                     INCLUDE_DIRS "core/inc"
                                  "platform/inc"
-                    REQUIRES driver
+                    REQUIRES driver esp_driver_gpio esp_driver_spi 
 )

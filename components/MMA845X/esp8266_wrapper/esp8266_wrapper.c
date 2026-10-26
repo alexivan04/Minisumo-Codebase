@@ -45,8 +45,8 @@ esp_err_t gpio_set_interrupt(gpio_num_t gpio,
     gpio_config(&gpio_cfg);
 
     // set interrupt handler
-    gpio_isr_handler_add(gpio, (gpio_isr_t)handler, (void*)gpio);
-    
+    // gpio_isr_handler_add(gpio, (gpio_isr_t)handler, (void*)gpio);
+    gpio_isr_handler_add(gpio, (gpio_isr_t)(void*)handler, (void*)(uintptr_t)gpio);
     return ESP_OK;
 }
 

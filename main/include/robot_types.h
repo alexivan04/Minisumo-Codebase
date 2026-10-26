@@ -14,7 +14,8 @@ typedef enum {
     ARCHING_VIPER,
     FOLLOW_LINE,
     PUSH_CONFIRM,
-    REPOSITION
+    REPOSITION,
+    PURE_TURN
 } state_t;
 
 typedef struct {

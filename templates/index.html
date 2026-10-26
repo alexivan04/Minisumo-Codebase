@@ -2,9 +2,9 @@
 <html>
 <head>
     <title>MiniSumo Real-Time Telemetry</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1"></script>
+    <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='chartjs-plugin-annotation.min.js') }}"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #eee; margin: 20px; }
         .dashboard { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
@@ -210,6 +210,9 @@
                     <div id="val-ax-graph" style="position: absolute; top: 10px; right: 20px; color: #dc3545; font-weight: bold; z-index: 10;">Value: -</div>
                     <canvas id="axChart"></canvas>
                 </div>
+                <div class="chart-container">
+                    <canvas id="sensorChart"></canvas>
+                </div>
             </div>
         </div>
     </div>
@@ -250,8 +253,7 @@
         const pwrCtx = document.getElementById('pwrChart').getContext('2d');
         const yawCtx = document.getElementById('yawChart').getContext('2d');
         const axCtx = document.getElementById('axChart').getContext('2d');
-
-        
+        const sensorCtx = document.getElementById('sensorChart').getContext('2d');
 
         const chartConfig = {
             type: 'line',
@@ -313,36 +315,58 @@
             }
         };
 
-        const pwrChart = new Chart(pwrCtx, JSON.parse(JSON.stringify(chartConfig)));
-        pwrChart.options.scales.y.max = 100;
-        pwrChart.options.scales.y.min = -100;
-        pwrChart.data.datasets = [{
-            label: 'Power %',
-            borderColor: '#007bff',
-            backgroundColor: 'rgba(0, 123, 255, 0.1)',
-            fill: true,
-            data: [],
-            borderWidth: 2,
-            pointRadius: 0
-        }];
+        const pwrChart = new Chart(pwrCtx, {
+            ...chartConfig,
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Power %',
+                    borderColor: '#007bff',
+                    backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                    fill: true,
+                    data: [],
+                    borderWidth: 2,
+                    pointRadius: 0
+                }]
+            }
+        });
 
-        const yawChart = new Chart(yawCtx, JSON.parse(JSON.stringify(chartConfig)));
-        yawChart.data.datasets = [{ 
-            label: 'Yaw', 
-            borderColor: '#28a745', 
-            data: [], 
-            borderWidth: 2, 
-            pointRadius: 0 
-        }];
+        const yawChart = new Chart(yawCtx, {
+            ...chartConfig,
+            data: {
+                labels: [],
+                datasets: [{ label: 'Yaw', borderColor: '#28a745', data: [], borderWidth: 2, pointRadius: 0 }]
+            }
+        });
 
-        const axChart = new Chart(axCtx, JSON.parse(JSON.stringify(chartConfig)));
-        axChart.data.datasets = [{ 
-            label: 'Accel X (G)', 
-            borderColor: '#dc3545', 
-            data: [], 
-            borderWidth: 2, 
-            pointRadius: 0 
-        }];
+        const axChart = new Chart(axCtx, {
+            ...chartConfig,
+            data: {
+                labels: [],
+                datasets: [{ label: 'Accel X (G)', borderColor: '#dc3545', data: [], borderWidth: 2, pointRadius: 0 }]
+            }
+        });
+
+        const sensorChart = new Chart(sensorCtx, {
+            ...chartConfig,
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'Center', borderColor: '#ffc107', data: [], stepped: true, pointRadius: 0 },
+                    { label: 'Right 90', borderColor: '#fd7e14', data: [], stepped: true, pointRadius: 0 },
+                    { label: 'Right', borderColor: '#dc3545', data: [], stepped: true, pointRadius: 0 },
+                    { label: 'Left 90', borderColor: '#6f42c1', data: [], stepped: true, pointRadius: 0 },
+                    { label: 'Left', borderColor: '#20c997', data: [], stepped: true, pointRadius: 0 }
+                ]
+            },
+            options: {
+                ...chartConfig.options,
+                scales: {
+                    ...chartConfig.options.scales,
+                    y: { min: -0.1, max: 1.1, ticks: { stepSize: 1, color: '#888' } }
+                }
+            }
+        });
 
         socket.on('connect', () => {
             console.log('CONNECTED TO SERVER');
@@ -356,11 +380,18 @@
 
         socket.on('telemetry_reset', () => {
             console.log("RESET SIGNAL RECEIVED");
-            [pwrChart, yawChart, axChart].forEach(chart => {
-                chart.data.labels = [];
-                chart.data.datasets.forEach(ds => ds.data = []);
-                chart.update();
-            });
+            pwrChart.data.labels = [];
+            pwrChart.data.datasets[0].data = [];
+            yawChart.data.labels = [];
+            yawChart.data.datasets.forEach(ds => ds.data = []);
+            axChart.data.labels = [];
+            axChart.data.datasets.forEach(ds => ds.data = []);
+            sensorChart.data.labels = [];
+            sensorChart.data.datasets.forEach(ds => ds.data = []);
+            pwrChart.update();
+            yawChart.update();
+            axChart.update();
+            sensorChart.update();
         });
 
         socket.on('telemetry_update', (data) => {
@@ -420,7 +451,19 @@
                 impactEl.style.color = '#eee';
             }
 
-            // NEW
+            // Detect Reset (T=0)
+            if (data.ts < 0.1 && pwrChart.data.labels.length > 50) {
+                console.log("Robot reset detected. Clearing charts.");
+                pwrChart.data.labels = [];
+                pwrChart.data.datasets[0].data = [];
+                yawChart.data.labels = [];
+                yawChart.data.datasets.forEach(ds => ds.data = []);
+                axChart.data.labels = [];
+                axChart.data.datasets.forEach(ds => ds.data = []);
+                sensorChart.data.labels = [];
+                sensorChart.data.datasets.forEach(ds => ds.data = []);
+            }
+
             if (data.ts > 0) {
                 // Init start position on first packet of a session
                 if (mapLastTs === 0) {
@@ -442,22 +485,33 @@
             mapHistory.push({ x: robotX, y: robotY, hit: mapHasCollided });
             drawDohyo();
 
-            // Update Charts
-            [pwrChart, yawChart, axChart].forEach(chart => {
-                chart.data.labels.push(data.ts);
-                if(chart.data.labels.length > 300) { // Show ~12 seconds of data at 25Hz
-                    chart.data.labels.shift();
-                    chart.data.datasets.forEach(ds => ds.data.shift());
-                }
+            // Keep the two charts aligned while showing the latest ~12 seconds.
+            pwrChart.data.labels.push(data.ts);
+            pwrChart.data.datasets[0].data.push(data.pwr);
+            yawChart.data.labels.push(data.ts);
+            yawChart.data.datasets[0].data.push(data.yaw);
+            axChart.data.labels.push(data.ts);
+            axChart.data.datasets[0].data.push(data.ax);
+            sensorChart.data.labels.push(data.ts);
+            [...data.sensors].forEach((value, index) => {
+                sensorChart.data.datasets[index].data.push(Number(value));
             });
 
-            pwrChart.data.datasets[0].data.push(data.pwr);
-            yawChart.data.datasets[0].data.push(data.yaw);
-            axChart.data.datasets[0].data.push(data.ax); 
+            if (pwrChart.data.labels.length > 300) {
+                pwrChart.data.labels.shift();
+                pwrChart.data.datasets[0].data.shift();
+                yawChart.data.labels.shift();
+                yawChart.data.datasets.forEach(ds => ds.data.shift());
+                axChart.data.labels.shift();
+                axChart.data.datasets.forEach(ds => ds.data.shift());
+                sensorChart.data.labels.shift();
+                sensorChart.data.datasets.forEach(ds => ds.data.shift());
+            }
 
-            pwrChart.update('none'); 
+            pwrChart.update('none'); // Update without animation for performance
             yawChart.update('none');
             axChart.update('none');
+            sensorChart.update('none');
         });
 
         function drawDohyo(limitIndex = -1) {
